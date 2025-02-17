@@ -375,6 +375,8 @@ class GRPOTrainer(Trainer):
                 if vllm_device == "auto":
                     if torch.cuda.device_count() == 1:
                         vllm_device = "cuda:0"  # particular case when training with onyl 1 GPU: share it
+                    elif torch.cuda.device_count() == self.args.vllm_tensor_parallel_size:
+                        vllm_device = f"cuda"
                     else:
                         vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
                 # Check that the requested device is available
@@ -411,6 +413,7 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
+                        tensor_parallel_size=self.args.vllm_tensor_parallel_size,
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
