@@ -380,7 +380,7 @@ class GRPOTrainer(Trainer):
                     else:
                         vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
                 # Check that the requested device is available
-                if vllm_device.split(":")[0] == "cuda" and int(vllm_device.split(":")[1]) >= torch.cuda.device_count():
+                if vllm_device.split(":")[0] == "cuda" and int((vllm_device.split(":") or [0])[1]) >= torch.cuda.device_count():
                     raise ValueError(
                         f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
                         "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
