@@ -495,8 +495,7 @@ class GRPOTrainer(BaseTrainer):
                         base_url = args.vllm_server_base_url
                     else:
                         base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
-                    self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
-                    self.vllm_client.init_communicator(device=torch.cuda.current_device())
+                    self.vllm_client = self._build_vllm_client(base_url, args.vllm_server_timeout)
 
             elif self.vllm_mode == "colocate":
                 # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
@@ -606,6 +605,11 @@ class GRPOTrainer(BaseTrainer):
                     self.reward_funcs[i] = self.accelerator.prepare_model(
                         reward_func, evaluation_mode=True, device_placement=True
                     )
+
+    def _build_vllm_client(self, base_url, timeout) -> VLLMClient:
+        vllm_client = VLLMClient(base_url=base_url, connection_timeout=timeout)
+        vllm_client.init_communicator(device=torch.cuda.current_device())
+        return vllm_client
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
