@@ -591,22 +591,72 @@ class GRPOTrainer(BaseTrainer):
             args.gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
             args.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
 
+        # Build the DataProducer for online rollout generation.
+        # The producer holds the prompt dataset and delegates generation to this trainer.
+        # The _OnlineEpochSource in the base Trainer handles rollout scheduling.
+        from transformers.data_producer import AsyncDataProducer, ProducerConfig
+
+        from .grpo_data_producer import GRPODataProducer
+
+        # Compute max_rollouts from dataset size when max_steps is not set.
+        # Each rollout consumes generation_batch_size / num_generations unique prompts.
+        import math
+
+        if args.max_steps > 0:
+            max_rollouts = None  # bounded by max_steps
+        elif train_dataset is not None and hasattr(train_dataset, "__len__"):
+            unique_prompts_per_rollout = args.generation_batch_size // args.num_generations
+            rollouts_per_epoch = math.ceil(len(train_dataset) / unique_prompts_per_rollout)
+            max_rollouts = rollouts_per_epoch * int(args.num_train_epochs)
+        else:
+            max_rollouts = None
+
+        producer_config = ProducerConfig(
+            mini_epochs=args.num_iterations,  # μ — reuse each rollout num_iterations times
+            max_rollouts=max_rollouts,
+            steps_per_generation=args.steps_per_generation,
+            num_iterations=args.num_iterations,
+            async_prefetch=args.async_prefetch,
+            # GRPO manages eval/train mode switching internally in
+            # _generate_and_score_completions; don't let _produce_data
+            # switch to eval which would confuse the train/eval dispatch.
+            eval_during_produce=False,
+            empty_cache_before_produce=True,
+            empty_cache_after_produce=True,
+        )
+
+        self._grpo_data_producer = GRPODataProducer(
+            config=producer_config,
+            prompt_dataset=train_dataset,
+            grpo_config=args,
+            num_generations=self.num_generations,
+        )
+
+        data_producer = self._grpo_data_producer
+        if args.async_prefetch:
+            data_producer = AsyncDataProducer(data_producer)
+
         super().__init__(
             model=model,
             args=args,
             data_collator=identity,  # No data collation is needed in GRPO
-            train_dataset=train_dataset,
+            train_dataset=None,
+            data_producer=data_producer,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
             # In Trainer, `training_step` scales the loss by `gradient_accumulation_steps` only if `compute_loss_func`
             # is None. For DAPO, loss scaling instead depends on the total number of completions tokens across the
-            # global accumulated batch. To control scaling ourselves, we must disable Trainer’s built-in scaling. The
+            # global accumulated batch. To control scaling ourselves, we must disable Trainer's built-in scaling. The
             # simplest (though a bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses
             # that behavior without rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
         )
+
+        # Give the producer a back-reference to this trainer so it can
+        # delegate to _generate_and_score_completions.
+        self._grpo_data_producer.set_trainer(self)
 
         # Reference model
         self.beta = args.beta
@@ -843,17 +893,16 @@ class GRPOTrainer(BaseTrainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt", "image", "images"]
 
-    # This method overrides `Trainer.get_train_dataloader` to support our custom batching strategy.
-    # Instead of returning a standard per-step batch (i.e., `per_device_batch_size), our dataloader loads an
-    # *generation* batch (i.e., `per_device_batch_size × steps_per_generation`). This allows us to generate completions
-    # once every steps_per_generation step—rather than once per accumulation step—which is significantly more
-    # efficient. The only change from the original implementation is multiplying the batch size by
-    # `steps_per_generation`. Thus, `_prepare_inputs` is called with this *generation* batch, and it handles the
-    # splitting internally.
-    # Maintenance note: This method is a copy-paste of the original `Trainer.get_train_dataloader` with only one line
-    # modification. As a result, some parts of the method aren't relevant to GRPO, but we keep them to stay one line
-    # apart from the super method, ensuring easier maintenance in the future.
+    # When using the DataProducer path, get_train_dataloader is not called for training
+    # (the _OnlineEpochSource creates dataloaders via _get_online_dataloader instead).
+    # We keep the override for backward compatibility but it now raises if the producer
+    # path is active (since self.train_dataset is None).
     def get_train_dataloader(self):
+        if self.train_dataset is None and self.data_producer is not None:
+            raise RuntimeError(
+                "get_train_dataloader() should not be called when using a DataProducer. "
+                "The _OnlineEpochSource handles dataloader creation automatically."
+            )
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -884,6 +933,14 @@ class GRPOTrainer(BaseTrainer):
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     def _get_train_sampler(self, dataset: Dataset | None = None) -> Sampler:
+        from .grpo_data_producer import RolloutDataset
+
+        # When the dataset is a RolloutDataset (from the DataProducer), use a simple
+        # sequential sampler — the data is already shuffled and ready for training.
+        if isinstance(dataset, RolloutDataset):
+            return torch.utils.data.SequentialSampler(dataset)
+
+        # Original RepeatSampler logic for the prompt dataset path.
         # Returns a sampler that
         # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
         #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
@@ -926,6 +983,26 @@ class GRPOTrainer(BaseTrainer):
             mini_repeat_count=self.num_generations_eval,
             seed=self.args.seed,
         )
+
+    def _get_online_dataloader(self, dataset) -> DataLoader:
+        """Create a DataLoader for a RolloutDataset produced by the DataProducer.
+
+        Uses :func:`rollout_collator` to stack per-sample dicts into batched
+        tensors, replacing the ``identity`` collator used for the prompt
+        dataset path.
+        """
+        from .grpo_data_producer import rollout_collator
+
+        dataloader_params = {
+            "batch_size": self._train_batch_size,
+            "collate_fn": rollout_collator,
+            "num_workers": 0,  # Data is already in memory, no need for workers
+            "pin_memory": self.args.dataloader_pin_memory,
+            "sampler": self._get_train_sampler(dataset),
+            "drop_last": self.args.dataloader_drop_last,
+        }
+
+        return self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
 
     @profiling_decorator
     def _get_last_hidden_state(
@@ -1095,35 +1172,33 @@ class GRPOTrainer(BaseTrainer):
         return output
 
     @profiling_decorator
-    def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
-        # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
-        # During training:
-        #   - Receives the local generation batch (Per-GPU batch size × steps per generation)
-        #     from the modified training dataloader instead of the standard local batch
-        #   - Generates completions once for the entire generation batch and splits it into batches of size
-        #     `per_device_train_batch_size`
-        #   - Buffers these completions and returns the appropriate slice for the current accumulation step
-        #   - Optimizes by regenerating completions only periodically (every steps_per_generation * num_iterations)
-        # During evaluation:
-        #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
-        #   - Completions are generated for each batch without buffering or reuse
-        # Returns a single local batch in both cases.
+    def _prepare_inputs(self, inputs: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        # With the DataProducer path, training inputs arrive pre-computed from the RolloutDataset.
+        # The _OnlineEpochSource handles rollout scheduling and mini-epoch reuse.
+        # During evaluation, we still generate completions on-the-fly.
 
         mode = "train" if self.model.training else "eval"
         if mode == "train":
-            generate_every = self.args.steps_per_generation * self.num_iterations
-            if self._step % generate_every == 0 or self._buffered_inputs is None:
-                # self._buffered_inputs=None can occur when resuming from a checkpoint
-                generation_batch = self._generate_and_score_completions(generation_batch)
-                generation_batch = split_pixel_values_by_grid(generation_batch)
-                generation_batch = shuffle_sequence_dict(generation_batch)
-                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
-            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+            if self.data_producer is not None:
+                # DataProducer path: inputs already contain pre-computed tensors
+                # (prompt_ids, completion_ids, advantages, etc.) from the RolloutDataset.
+                # Just move tensors to device via the parent's _prepare_inputs.
+                return super()._prepare_inputs(inputs)
+            else:
+                # Legacy path (kept for backward compatibility)
+                generation_batch = inputs
+                generate_every = self.args.steps_per_generation * self.num_iterations
+                if self._step % generate_every == 0 or self._buffered_inputs is None:
+                    generation_batch = self._generate_and_score_completions(generation_batch)
+                    generation_batch = split_pixel_values_by_grid(generation_batch)
+                    generation_batch = shuffle_sequence_dict(generation_batch)
+                    generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                    self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+                inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
-            inputs = self._generate_and_score_completions(generation_batch)
+            inputs = self._generate_and_score_completions(inputs)
         return inputs
 
     @profiling_decorator

@@ -400,6 +400,14 @@ class GRPOConfig(BaseConfig):
         default=None,
         metadata={"help": "Number of steps per generation. If `None`, it defaults to `gradient_accumulation_steps`."},
     )
+    async_prefetch: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, prefetch the next rollout in a background thread while training on the current one. "
+            "Most effective with `use_vllm=True` and `vllm_mode='server'`, where generation is offloaded to a "
+            "separate process and CPU-bound reward computation can overlap with GPU training."
+        },
+    )
     temperature: float = field(
         default=1.0,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
