@@ -1184,7 +1184,16 @@ class GRPOTrainer(BaseTrainer):
                 # DataProducer path: inputs already contain pre-computed tensors
                 # (prompt_ids, completion_ids, advantages, etc.) from the RolloutDataset.
                 # Just move tensors to device via the parent's _prepare_inputs.
-                return super()._prepare_inputs(inputs)
+                inputs = super()._prepare_inputs(inputs)
+
+                # When async_prefetch is enabled, forward passes through self.model are
+                # deferred from the background produce() thread to this point on the main
+                # thread.  This avoids a race condition where the background thread would
+                # read model weights while the main thread updates them during training.
+                if inputs.get("_deferred_logps") is not None:
+                    inputs = self._compute_deferred_logps(inputs)
+
+                return inputs
             else:
                 # Legacy path (kept for backward compatibility)
                 generation_batch = inputs
@@ -1200,6 +1209,101 @@ class GRPOTrainer(BaseTrainer):
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(inputs)
+        return inputs
+
+    def _compute_deferred_logps(self, inputs: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        """Compute old_per_token_logps and related values that were deferred from the background produce() thread.
+
+        When ``async_prefetch=True``, ``_generate_and_score_completions`` skips forward passes through ``self.model``
+        to avoid a race condition with concurrent training.  This method runs those forward passes synchronously on
+        the main thread, using the current model weights (which reflect the state at the start of this rollout's
+        training, before any gradient updates from this batch).
+        """
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        batch_size = self.args.per_device_train_batch_size
+
+        # Build forward kwargs for multimodal models
+        forward_kwargs = {}
+        if "pixel_values" in inputs:
+            forward_kwargs["pixel_values"] = inputs["pixel_values"]
+        if "image_grid_thw" in inputs:
+            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
+        if "pixel_attention_mask" in inputs:
+            forward_kwargs["pixel_attention_mask"] = inputs["pixel_attention_mask"]
+        if "image_sizes" in inputs:
+            forward_kwargs["image_sizes"] = inputs["image_sizes"]
+        if "token_type_ids" in inputs:
+            forward_kwargs["token_type_ids"] = inputs["token_type_ids"]
+        num_images = inputs.get("num_images")
+
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            # Compute old_per_token_logps
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                    num_images=num_images,
+                    **forward_kwargs,
+                )
+                inputs["old_per_token_logps"] = old_per_token_logps
+
+            # Compute importance sampling ratio for vLLM
+            if (
+                self.use_vllm
+                and self.vllm_importance_sampling_correction
+                and "old_per_token_logps" in inputs
+                and "sampling_per_token_logps" in inputs
+            ):
+                tool_mask = inputs.get("tool_mask")
+                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+                per_token_logps_diff = (inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"]) * mask
+
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                else:
+                    logps_diff = per_token_logps_diff
+
+                vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    vllm_importance_sampling_ratio = torch.clamp(
+                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                    )
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    )
+
+                inputs["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+
+            # Compute ref_per_token_logps for PEFT adapter path (uses self.model)
+            if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in inputs:
+                model = self.accelerator.unwrap_model(self.model)
+                with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
+                    )
+                inputs["ref_per_token_logps"] = ref_per_token_logps
+
+        # Clean up the sentinel flag
+        del inputs["_deferred_logps"]
         return inputs
 
     @profiling_decorator
@@ -1773,6 +1877,11 @@ class GRPOTrainer(BaseTrainer):
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
         # Temporarily disable checkpointing to avoid this warning during inference.
+        # When async_prefetch is enabled, skip forward passes through self.model here because produce()
+        # may run in a background thread concurrently with training.  These are deferred to
+        # _compute_deferred_logps() which runs on the main thread before the loss computation.
+        defer_model_logps = getattr(self.args, "async_prefetch", False) and mode == "train"
+
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
             # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
@@ -1782,9 +1891,10 @@ class GRPOTrainer(BaseTrainer):
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+            needs_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
-            ):
+            )
+            if needs_old_logps and not defer_model_logps:
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
@@ -1798,7 +1908,7 @@ class GRPOTrainer(BaseTrainer):
                 old_per_token_logps = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
+            if self.use_vllm and self.vllm_importance_sampling_correction and not defer_model_logps:
                 mask = completion_mask if tool_mask is None else completion_mask * tool_mask
                 per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
 
@@ -1831,6 +1941,7 @@ class GRPOTrainer(BaseTrainer):
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
+                    # Separate ref_model is frozen — safe to run from any thread
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
@@ -1840,7 +1951,8 @@ class GRPOTrainer(BaseTrainer):
                         num_images=num_images,
                         **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                     )
-                else:
+                elif not defer_model_logps:
+                    # PEFT adapter path uses self.model — must run on main thread
                     # When training a PEFT adapter, how we obtain the reference depends on the setup:
                     # - New adapter: disabling adapters yields the base model.
                     # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
@@ -1855,6 +1967,8 @@ class GRPOTrainer(BaseTrainer):
                             num_images=num_images,
                             **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                         )
+                else:
+                    ref_per_token_logps = None
             else:
                 ref_per_token_logps = None
 
@@ -1995,9 +2109,13 @@ class GRPOTrainer(BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
+        if defer_model_logps:
+            # Signal that old_per_token_logps (and possibly ref_per_token_logps / IS ratio)
+            # must be computed on the main thread before the loss step.
+            output["_deferred_logps"] = torch.tensor(True)
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if self.use_vllm and self.vllm_importance_sampling_correction and not defer_model_logps:
             output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
