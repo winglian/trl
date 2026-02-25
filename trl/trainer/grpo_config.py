@@ -408,6 +408,14 @@ class GRPOConfig(BaseConfig):
             "separate process and CPU-bound reward computation can overlap with GPU training."
         },
     )
+    prefetch_depth: int = field(
+        default=1,
+        metadata={
+            "help": "Number of rollouts to prefetch when `async_prefetch=True`. Higher values keep the GPU more "
+            "saturated but increase off-policy staleness — each additional prefetch adds approximately "
+            "`steps_per_generation * num_iterations` optimizer steps of staleness. Default is 1 (one rollout ahead)."
+        },
+    )
     temperature: float = field(
         default=1.0,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},

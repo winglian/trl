@@ -617,6 +617,7 @@ class GRPOTrainer(BaseTrainer):
             steps_per_generation=args.steps_per_generation,
             num_iterations=args.num_iterations,
             async_prefetch=args.async_prefetch,
+            prefetch_depth=args.prefetch_depth,
             # GRPO manages eval/train mode switching internally in
             # _generate_and_score_completions; don't let _produce_data
             # switch to eval which would confuse the train/eval dispatch.
@@ -997,7 +998,7 @@ class GRPOTrainer(BaseTrainer):
             "batch_size": self._train_batch_size,
             "collate_fn": rollout_collator,
             "num_workers": 0,  # Data is already in memory, no need for workers
-            "pin_memory": self.args.dataloader_pin_memory,
+            "pin_memory": False,  # Rollout tensors are already on the training device
             "sampler": self._get_train_sampler(dataset),
             "drop_last": self.args.dataloader_drop_last,
         }
