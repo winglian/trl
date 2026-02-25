@@ -988,15 +988,20 @@ class GRPOTrainer(BaseTrainer):
     def _get_online_dataloader(self, dataset) -> DataLoader:
         """Create a DataLoader for a RolloutDataset produced by the DataProducer.
 
-        Uses :func:`rollout_collator` to stack per-sample dicts into batched
-        tensors, replacing the ``identity`` collator used for the prompt
-        dataset path.
+        Uses a collator from :func:`make_rollout_collator` that knows which
+        keys are shared metadata (e.g. ``num_items_in_batch``) vs per-sample
+        values that must be stacked (e.g. ``advantages``).
         """
-        from .grpo_data_producer import rollout_collator
+        from .grpo_data_producer import make_rollout_collator
+
+        # RolloutDataset tracks which keys are shared (0-dim / non-tensor in
+        # the original rollout output) vs per-sample (had a batch dimension).
+        shared_keys = getattr(dataset, "_shared_keys", set())
+        collate_fn = make_rollout_collator(shared_keys)
 
         dataloader_params = {
             "batch_size": self._train_batch_size,
-            "collate_fn": rollout_collator,
+            "collate_fn": collate_fn,
             "num_workers": 0,  # Data is already in memory, no need for workers
             "pin_memory": False,  # Rollout tensors are already on the training device
             "sampler": self._get_train_sampler(dataset),
@@ -2065,7 +2070,7 @@ class GRPOTrainer(BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if self.use_vllm and self.vllm_importance_sampling_correction and old_per_token_logps is not None:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
             mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
             delta = delta[mask]

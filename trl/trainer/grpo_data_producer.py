@@ -39,17 +39,29 @@ class RolloutDataset(Dataset):
 
     Each item is a dict slice ``{key: tensor[idx]}`` suitable for the
     GRPO loss computation in ``GRPOTrainer._compute_loss``.
+
+    Keys whose original values are 0-dim tensors or non-tensors are treated as
+    *shared* metadata (e.g. ``num_items_in_batch``).  Keys whose original values
+    have a batch dimension (``dim() > 0``) are *per-sample* — they are indexed
+    in ``__getitem__`` and must be stacked by the collator even though they
+    become 0-dim scalars after indexing (e.g. ``advantages``).
     """
 
     def __init__(self, data: dict[str, torch.Tensor | Any]):
         self._data = data
-        # Find length from the first tensor value
-        for v in data.values():
-            if isinstance(v, torch.Tensor):
-                self._len = v.size(0)
-                break
-        else:
-            raise ValueError("RolloutDataset requires at least one tensor value")
+        # Keys that are shared across all samples (0-dim tensors or non-tensors).
+        # Everything else is per-sample and will be indexed in __getitem__.
+        self._shared_keys: set[str] = set()
+        found_len = False
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor) and v.dim() > 0:
+                if not found_len:
+                    self._len = v.size(0)
+                    found_len = True
+            else:
+                self._shared_keys.add(k)
+        if not found_len:
+            raise ValueError("RolloutDataset requires at least one tensor value with dim > 0")
 
     def __len__(self) -> int:
         return self._len
@@ -57,34 +69,39 @@ class RolloutDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         result = {}
         for k, v in self._data.items():
-            if isinstance(v, torch.Tensor) and v.dim() > 0:
-                result[k] = v[idx]
-            else:
-                # Scalar tensors and non-tensor values are shared across samples
+            if k in self._shared_keys:
                 result[k] = v
+            else:
+                result[k] = v[idx]
         return result
 
 
-def rollout_collator(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate a list of per-sample dicts into a batched dict of stacked tensors.
+def make_rollout_collator(shared_keys: set[str]):
+    """Return a collator that knows which keys are shared metadata.
 
-    Scalar (0-dim) tensors are shared across all samples in the rollout and
-    are passed through as-is (not stacked).  Non-tensor values are collected
-    into a list.
+    Args:
+        shared_keys: Keys whose values are identical across all samples
+            (e.g. ``num_items_in_batch``, ``_deferred_logps``).  These are
+            passed through as-is.  All other tensor keys are stacked along
+            a new batch dimension — even 0-dim scalars (e.g. per-sample
+            ``advantages`` values).
     """
-    keys = batch[0].keys()
-    collated = {}
-    for key in keys:
-        values = [item[key] for item in batch]
-        if isinstance(values[0], torch.Tensor):
-            if values[0].dim() == 0:
-                # Scalar tensors are shared metadata — take first value
+
+    def rollout_collator(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        keys = batch[0].keys()
+        collated = {}
+        for key in keys:
+            values = [item[key] for item in batch]
+            if key in shared_keys:
+                # Shared metadata — take first value (all identical)
                 collated[key] = values[0]
-            else:
+            elif isinstance(values[0], torch.Tensor):
                 collated[key] = torch.stack(values)
-        else:
-            collated[key] = values
-    return collated
+            else:
+                collated[key] = values
+        return collated
+
+    return rollout_collator
 
 
 class GRPODataProducer(BaseDataProducer, DataProducerCallback):
