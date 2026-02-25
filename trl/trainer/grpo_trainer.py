@@ -20,6 +20,7 @@ import inspect
 import os
 import sys
 import textwrap
+import threading
 import time
 import warnings
 from collections import defaultdict, deque
@@ -744,6 +745,9 @@ class GRPOTrainer(BaseTrainer):
             "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             "advantages": deque(maxlen=args.generation_batch_size),
         }
+        # Lock protecting shared mutable state (_metrics, _logs, state.num_input_tokens_seen)
+        # when async_prefetch=True and produce() runs in a background thread.
+        self._metrics_lock = threading.Lock()
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -984,6 +988,149 @@ class GRPOTrainer(BaseTrainer):
             mini_repeat_count=self.num_generations_eval,
             seed=self.args.seed,
         )
+
+    def _materialize_deferred_logps(self, dataset) -> None:
+        """Compute old_per_token_logps and IS ratio for an entire RolloutDataset.
+
+        When ``async_prefetch=True``, ``_generate_and_score_completions`` skips
+        forward passes through ``self.model`` to avoid a race condition with
+        concurrent training.  This method computes those values for the FULL
+        rollout in one shot, using the current model weights, before any
+        gradient updates from this rollout.  This ensures:
+
+        * All samples in the rollout see the same model state for IS ratio
+          computation (consistent importance weights across the epoch).
+        * No extra per-step overhead during training (``_compute_deferred_logps``
+          in ``_prepare_inputs`` becomes a no-op because ``_deferred_logps``
+          has been removed).
+        * The IS ratio matches the sync path's semantics where
+          ``old_per_token_logps`` is computed at generation time.
+        """
+        from .grpo_data_producer import RolloutDataset
+
+        if not isinstance(dataset, RolloutDataset):
+            return
+        data = dataset._data
+        if "_deferred_logps" not in data:
+            return
+
+        prompt_ids = data["prompt_ids"]
+        prompt_mask = data["prompt_mask"]
+        completion_ids = data["completion_ids"]
+        completion_mask = data["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        batch_size = self.args.per_device_train_batch_size
+
+        # Build forward kwargs for multimodal models
+        forward_kwargs = {}
+        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes", "token_type_ids"):
+            if key in data:
+                forward_kwargs[key] = data[key]
+        num_images = data.get("num_images")
+
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            needs_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            )
+
+            if needs_old_logps:
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                    num_images=num_images,
+                    **forward_kwargs,
+                )
+                data["old_per_token_logps"] = old_per_token_logps
+
+            # Compute importance sampling ratio for vLLM
+            if (
+                self.use_vllm
+                and self.vllm_importance_sampling_correction
+                and "old_per_token_logps" in data
+                and "sampling_per_token_logps" in data
+            ):
+                tool_mask = data.get("tool_mask")
+                mask = completion_mask if tool_mask is None else completion_mask * data["tool_mask"]
+                per_token_logps_diff = (data["old_per_token_logps"] - data["sampling_per_token_logps"]) * mask
+
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                else:
+                    logps_diff = per_token_logps_diff
+
+                vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    vllm_importance_sampling_ratio = torch.clamp(
+                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                    )
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    )
+
+                data["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+
+                # Log IS / sampling metrics (same as _generate_and_score_completions)
+                device = data["old_per_token_logps"].device
+                delta = torch.abs(data["old_per_token_logps"] - data["sampling_per_token_logps"])
+                bool_mask = mask.bool()
+                delta_masked = delta[bool_mask]
+                mean_delta = torch.mean(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
+                max_delta = torch.max(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
+                    self.accelerator.gather(mean_delta).mean().item()
+                )
+                self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
+                    self.accelerator.gather(max_delta).max().item()
+                )
+                if sequence_level_is:
+                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                else:
+                    flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
+                min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                mean_is = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
+                    nanmin(self.accelerator.gather(min_is)).item()
+                )
+                self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
+                    self.accelerator.gather(mean_is).nanmean().item()
+                )
+                self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
+                    nanmax(self.accelerator.gather(max_is)).item()
+                )
+
+            # Compute ref_per_token_logps for PEFT adapter path
+            if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in data:
+                model = self.accelerator.unwrap_model(self.model)
+                with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
+                    )
+                data["ref_per_token_logps"] = ref_per_token_logps
+
+        # Remove the deferred sentinel — data is now fully materialized
+        del data["_deferred_logps"]
+        dataset._shared_keys.discard("_deferred_logps")
+
+        # Update shared_keys since we added new per-sample tensors
+        for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
+            if key in data:
+                dataset._shared_keys.discard(key)
 
     def _get_online_dataloader(self, dataset) -> DataLoader:
         """Create a DataLoader for a RolloutDataset produced by the DataProducer.
@@ -1291,6 +1438,37 @@ class GRPOTrainer(BaseTrainer):
                     )
 
                 inputs["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+
+                # Log the same IS / sampling metrics that _generate_and_score_completions
+                # would have logged if old_per_token_logps had not been deferred.
+                device = inputs["old_per_token_logps"].device
+                delta = torch.abs(inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"])
+                bool_mask = mask.bool()
+                delta = delta[bool_mask]
+                mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
+                    self.accelerator.gather(mean_delta).mean().item()
+                )
+                self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
+                    self.accelerator.gather(max_delta).max().item()
+                )
+                if sequence_level_is:
+                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                else:
+                    flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
+                min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                mean_is = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
+                    nanmin(self.accelerator.gather(min_is)).item()
+                )
+                self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
+                    self.accelerator.gather(mean_is).nanmean().item()
+                )
+                self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
+                    nanmax(self.accelerator.gather(max_is)).item()
+                )
 
             # Compute ref_per_token_logps for PEFT adapter path (uses self.model)
             if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in inputs:
@@ -1726,37 +1904,41 @@ class GRPOTrainer(BaseTrainer):
         total_prompt_tokens = agg_prompt_lengths.sum()
         total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
 
-        # Log the metrics
-        if mode == "train":
-            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
-        self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+        # Log the metrics.  When async_prefetch is enabled and this runs on a background thread,
+        # use a lock to protect shared mutable state (_metrics, _logs, state).
+        with self._metrics_lock:
+            if mode == "train":
+                self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
+            self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-        # Log completion lengths, mean, min, max
-        self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+            # Log completion lengths, mean, min, max
+            self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
         # Identify sequences that terminated with EOS and log their lengths
         eos_and_pad = [self.eos_token_id, self.pad_token_id]
         is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
-        self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
-        term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
-            term_completion_lengths = torch.zeros(1, device=device)
-        self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+        with self._metrics_lock:
+            self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
+            term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
+            if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+                term_completion_lengths = torch.zeros(1, device=device)
+            self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
         if self.tools:
             agg_tool_call_count = self.accelerator.gather(torch.tensor(tool_call_count, device=device)).sum()
-            tool_call_frequency = (agg_tool_call_count / len(agg_prompt_lengths)).item()
-            self._metrics[mode]["tools/call_frequency"].append(tool_call_frequency)
             agg_tool_failure_count = self.accelerator.gather(torch.tensor(tool_failure_count, device=device)).sum()
-            failure_frequency = (
-                (agg_tool_failure_count / agg_tool_call_count).item() if agg_tool_call_count > 0 else 0.0
-            )
-            self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
+            with self._metrics_lock:
+                tool_call_frequency = (agg_tool_call_count / len(agg_prompt_lengths)).item()
+                self._metrics[mode]["tools/call_frequency"].append(tool_call_frequency)
+                failure_frequency = (
+                    (agg_tool_failure_count / agg_tool_call_count).item() if agg_tool_call_count > 0 else 0.0
+                )
+                self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
 
         return (
             prompt_ids,
@@ -2050,25 +2232,30 @@ class GRPOTrainer(BaseTrainer):
         advantages = advantages[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-        for i, reward_func_name in enumerate(self.reward_func_names):
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
         rewards = rewards_per_func.nansum(dim=1)
-        self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(rewards.std().item())
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+        with self._metrics_lock:
+            for i, reward_func_name in enumerate(self.reward_func_names):
+                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+                std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            self._metrics[mode]["reward_std"].append(rewards.std().item())
+            self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        # Log prompt and completion texts
-        self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["completion"].extend(gather_object(completions_text))
-        for i, name in enumerate(self.reward_func_names):
-            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._logs["advantages"].extend(all_process_advantages.tolist())
-
-        if images is not None:
-            self._logs["images"].extend(gather_object(images))
+        # Log prompt and completion texts.  The gather_object() calls are
+        # collective operations; on single-GPU they are no-ops.
+        gathered_prompts = gather_object(prompts_text)
+        gathered_completions = gather_object(completions_text)
+        gathered_images = gather_object(images) if images is not None else None
+        with self._metrics_lock:
+            self._logs["prompt"].extend(gathered_prompts)
+            self._logs["completion"].extend(gathered_completions)
+            for i, name in enumerate(self.reward_func_names):
+                self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+            self._logs["advantages"].extend(all_process_advantages.tolist())
+            if gathered_images is not None:
+                self._logs["images"].extend(gathered_images)
 
         if self.use_vllm and self.vllm_importance_sampling_correction and old_per_token_logps is not None:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
@@ -2415,16 +2602,17 @@ class GRPOTrainer(BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        with self._metrics_lock:
+            metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
-        if mode == "eval":
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+            # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+            if mode == "eval":
+                metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
-        logs = {**logs, **metrics}
+            logs = {**logs, **metrics}
+            self._metrics[mode].clear()
         super().log(logs, start_time)
-        self._metrics[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
             if is_rich_available():
