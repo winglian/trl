@@ -1032,17 +1032,17 @@ class GRPOTrainer(BaseTrainer):
     def _materialize_deferred_logps(self, dataset) -> None:
         """Compute old_per_token_logps and IS ratio for an entire RolloutDataset.
 
-        When ``async_prefetch=True``, ``_generate_and_score_completions`` skips
-        forward passes through ``self.model`` to avoid a race condition with
-        concurrent training.  This method computes those values for the FULL
-        rollout in one shot, using the current model weights, before any
-        gradient updates from this rollout.  This ensures:
+        When ``skip_model_logps=True`` (async background submissions),
+        ``_generate_and_score_completions`` skips forward passes through
+        ``self.model`` to avoid a race condition with concurrent training.
+        This method computes those values for the FULL rollout in one shot,
+        using the current model weights, before any gradient updates from
+        this rollout.  This ensures:
 
         * All samples in the rollout see the same model state for IS ratio
           computation (consistent importance weights across the epoch).
-        * No extra per-step overhead during training (``_compute_deferred_logps``
-          in ``_prepare_inputs`` becomes a no-op because ``_deferred_logps``
-          has been removed).
+        * No extra per-step overhead during training — the ``_deferred_logps``
+          sentinel is cleared here so ``_prepare_inputs`` never sees it.
         * The IS ratio matches the sync path's semantics where
           ``old_per_token_logps`` is computed at generation time.
         """
@@ -1384,19 +1384,14 @@ class GRPOTrainer(BaseTrainer):
                 # Just move tensors to device via the parent's _prepare_inputs.
                 inputs = super()._prepare_inputs(inputs)
 
-                # When async_prefetch is enabled, forward passes through self.model are
-                # deferred from the background produce() thread to this point on the main
-                # thread.  This avoids a race condition where the background thread would
-                # read model weights while the main thread updates them during training.
-                if inputs.get("_deferred_logps") is not None:
-                    if not getattr(self, "_warned_deferred_fallback", False):
-                        logger.warning(
-                            "Falling back to per-batch deferred logprob materialization in _prepare_inputs. "
-                            "This is slower and can increase off-policy drift."
-                        )
-                        self._warned_deferred_fallback = True
-                    self._metrics["train"]["debug/deferred_fallback_batches"].append(1.0)
-                    inputs = self._compute_deferred_logps(inputs)
+                # With the verl-like architecture, all deferred logps are materialized
+                # at rollout granularity by _materialize_deferred_logps (called from
+                # _produce_data / iter_epochs) BEFORE any training batches are created.
+                # If _deferred_logps is still present here, something is wrong.
+                assert inputs.get("_deferred_logps") is None, (
+                    "Batch still has deferred logps — _materialize_deferred_logps should have "
+                    "been called on the full rollout before training started."
+                )
 
                 return inputs
             else:
@@ -1414,132 +1409,6 @@ class GRPOTrainer(BaseTrainer):
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(inputs)
-        return inputs
-
-    def _compute_deferred_logps(self, inputs: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
-        """Compute old_per_token_logps and related values that were deferred from the background produce() thread.
-
-        When ``async_prefetch=True``, ``_generate_and_score_completions`` skips forward passes through ``self.model``
-        to avoid a race condition with concurrent training.  This method runs those forward passes synchronously on
-        the main thread, using the current model weights (which reflect the state at the start of this rollout's
-        training, before any gradient updates from this batch).
-        """
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
-        batch_size = self.args.per_device_train_batch_size
-
-        # Build forward kwargs for multimodal models
-        forward_kwargs = {}
-        if "pixel_values" in inputs:
-            forward_kwargs["pixel_values"] = inputs["pixel_values"]
-        if "image_grid_thw" in inputs:
-            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
-        if "pixel_attention_mask" in inputs:
-            forward_kwargs["pixel_attention_mask"] = inputs["pixel_attention_mask"]
-        if "image_sizes" in inputs:
-            forward_kwargs["image_sizes"] = inputs["image_sizes"]
-        if "token_type_ids" in inputs:
-            forward_kwargs["token_type_ids"] = inputs["token_type_ids"]
-        num_images = inputs.get("num_images")
-
-        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-            generate_every = self.args.steps_per_generation * self.num_iterations
-            needs_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            )
-            if needs_old_logps:
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
-                inputs["old_per_token_logps"] = old_per_token_logps
-
-            # Compute importance sampling ratio for vLLM
-            if (
-                self.use_vllm
-                and self.vllm_importance_sampling_correction
-                and "old_per_token_logps" in inputs
-                and "sampling_per_token_logps" in inputs
-            ):
-                tool_mask = inputs.get("tool_mask")
-                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
-                per_token_logps_diff = (inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"]) * mask
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                else:
-                    logps_diff = per_token_logps_diff
-
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                    )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
-                    )
-
-                inputs["importance_sampling_ratio"] = vllm_importance_sampling_ratio
-
-                # Log the same IS / sampling metrics that _generate_and_score_completions
-                # would have logged if old_per_token_logps had not been deferred.
-                device = inputs["old_per_token_logps"].device
-                delta = torch.abs(inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"])
-                bool_mask = mask.bool()
-                delta = delta[bool_mask]
-                mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
-                    self.accelerator.gather(mean_delta).mean().item()
-                )
-                self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
-                    self.accelerator.gather(max_delta).max().item()
-                )
-                if sequence_level_is:
-                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-                else:
-                    flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
-                min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                mean_is = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
-                    nanmin(self.accelerator.gather(min_is)).item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
-                    self.accelerator.gather(mean_is).nanmean().item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
-                    nanmax(self.accelerator.gather(max_is)).item()
-                )
-
-            # Compute ref_per_token_logps for PEFT adapter path (uses self.model)
-            if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in inputs:
-                model = self.accelerator.unwrap_model(self.model)
-                with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.model,
-                        input_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,
-                    )
-                inputs["ref_per_token_logps"] = ref_per_token_logps
-
-        # Clean up the sentinel flag
-        del inputs["_deferred_logps"]
         return inputs
 
     @profiling_decorator
@@ -2008,7 +1877,7 @@ class GRPOTrainer(BaseTrainer):
         )
 
     def _generate_and_score_completions(
-        self, inputs: list[dict[str, torch.Tensor | Any]]
+        self, inputs: list[dict[str, torch.Tensor | Any]], *, skip_model_logps: bool = False
     ) -> dict[str, torch.Tensor | Any]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
@@ -2122,15 +1991,11 @@ class GRPOTrainer(BaseTrainer):
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
         # Temporarily disable checkpointing to avoid this warning during inference.
         #
-        # Defer self.model forward passes only when produce() is actually running in a background thread. During
-        # synchronous phases (no-async, async warmup, and first async call before the prefetch queue is active), we
-        # can safely compute these values inline and match no-async behavior.
-        in_background_produce_thread = threading.current_thread() is not threading.main_thread()
-        defer_model_logps = (
-            mode == "train"
-            and getattr(self.args, "async_prefetch", False)
-            and in_background_produce_thread
-        )
+        # When skip_model_logps=True (async background submissions), defer self.model forward passes.
+        # They will be computed later on the main thread by _materialize_deferred_logps.
+        # During synchronous phases (no-async, async warmup, first async call), skip_model_logps=False
+        # and logps are computed inline — identical to the no-async path.
+        defer_model_logps = skip_model_logps and mode == "train"
 
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of

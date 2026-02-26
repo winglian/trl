@@ -229,7 +229,9 @@ class GRPODataProducer(BaseDataProducer, DataProducerCallback):
         inputs = self._sample_prompts()
 
         # Run the full GRPO generation + scoring pipeline
-        generation_output = trainer._generate_and_score_completions(inputs)
+        generation_output = trainer._generate_and_score_completions(
+            inputs, skip_model_logps=kwargs.get("skip_model_logps", False)
+        )
 
         # Shuffle and split into per-step chunks, then recombine as flat dataset
         generation_output = split_pixel_values_by_grid(generation_output)
