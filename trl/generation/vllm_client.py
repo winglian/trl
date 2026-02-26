@@ -287,12 +287,14 @@ class VLLMClient:
         )
         if response.status_code == 200:
             json_response = response.json()
-            return {
+            result = {
                 "prompt_ids": json_response["prompt_ids"],
                 "completion_ids": json_response["completion_ids"],
                 "logprobs": json_response["logprobs"],
-                "logprob_token_ids": json_response["logprob_token_ids"],
             }
+            if "logprob_token_ids" in json_response:
+                result["logprob_token_ids"] = json_response["logprob_token_ids"]
+            return result
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
@@ -404,12 +406,14 @@ class VLLMClient:
         )
         if response.status_code == 200:
             json_response = response.json()
-            return {
+            result = {
                 "prompt_ids": json_response["prompt_ids"],
                 "completion_ids": json_response["completion_ids"],
                 "logprobs": json_response["logprobs"],
-                "logprob_token_ids": json_response["logprob_token_ids"],
             }
+            if "logprob_token_ids" in json_response:
+                result["logprob_token_ids"] = json_response["logprob_token_ids"]
+            return result
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
