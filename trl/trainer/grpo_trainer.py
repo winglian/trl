@@ -989,6 +989,21 @@ class GRPOTrainer(BaseTrainer):
             seed=self.args.seed,
         )
 
+    def _produce_data(self, model):
+        """Override to sync vLLM weights on the main thread before async generation.
+
+        When ``async_prefetch=True``, the base ``AsyncDataProducer.produce()`` submits
+        generation work to a background thread.  The vLLM weight sync must happen on
+        the main thread at a well-defined point (no concurrent gradient updates) so
+        that the background generation uses a consistent snapshot of the model.
+        """
+        if self.use_vllm and getattr(self.args, "async_prefetch", False):
+            if self.state.global_step != self._last_loaded_step:
+                with profiling_context(self, "sync_weights"):
+                    self.vllm_generation.sync_weights()
+                self._last_loaded_step = self.state.global_step
+        return super()._produce_data(model)
+
     def _materialize_deferred_logps(self, dataset) -> None:
         """Compute old_per_token_logps and IS ratio for an entire RolloutDataset.
 
@@ -1122,6 +1137,56 @@ class GRPOTrainer(BaseTrainer):
                         **forward_kwargs,
                     )
                 data["ref_per_token_logps"] = ref_per_token_logps
+
+        # Recompute advantages from per-function rewards.
+        # The original advantages were computed at generation time using the stale policy's completions.
+        # While the rewards themselves are deterministic given the completions, recomputing here
+        # ensures group normalization uses the gathered rewards across all processes at a consistent
+        # point in training, and allows future extensions (e.g., reward reweighting).
+        if "_rewards_per_func" in data:
+            local_rewards_per_func = data["_rewards_per_func"]
+            rewards_per_func = gather(local_rewards_per_func)
+            num_generations = self.num_generations
+            device = local_rewards_per_func.device
+
+            if self.multi_objective_aggregation == "sum_then_normalize":
+                rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+                mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+                mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+                if self.scale_rewards in ["group", "none"]:
+                    if num_generations > 1:
+                        std_rewards = rewards.view(-1, num_generations).std(dim=1)
+                        std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+                    else:
+                        std_rewards = torch.zeros_like(rewards)
+                elif self.scale_rewards == "batch":
+                    if rewards.numel() > 1:
+                        std_rewards = rewards.std().expand_as(rewards)
+                    else:
+                        std_rewards = torch.zeros_like(rewards)
+                advantages = rewards - mean_grouped_rewards
+                if self.scale_rewards != "none":
+                    advantages = advantages / (std_rewards + 1e-4)
+            elif self.multi_objective_aggregation == "normalize_then_sum":
+                grouped = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
+                mean_k = torch.nanmean(grouped, dim=1, keepdim=True)
+                std_k = nanstd(grouped, dim=1, keepdim=True) if num_generations > 1 else torch.zeros_like(mean_k)
+                reward_k = (grouped - mean_k) / (std_k + 1e-4)
+                reward_k = reward_k.view(-1, len(self.reward_funcs))
+                rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+                std_rewards = rewards.std().expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
+                advantages = (rewards - rewards.mean()) / (std_rewards + 1e-4)
+
+            # Slice to local process
+            process_slice = slice(
+                self.accelerator.process_index * len(local_rewards_per_func),
+                (self.accelerator.process_index + 1) * len(local_rewards_per_func),
+            )
+            data["advantages"] = advantages[process_slice]
+
+            # Clean up the temporary rewards storage
+            del data["_rewards_per_func"]
+            dataset._shared_keys.discard("_rewards_per_func")
 
         # Remove the deferred sentinel — data is now fully materialized
         del data["_deferred_logps"]
@@ -1579,11 +1644,15 @@ class GRPOTrainer(BaseTrainer):
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
-            # Sync weights if training step changed
-            if self.state.global_step != self._last_loaded_step:
-                with profiling_context(self, "sync_weights"):
-                    self.vllm_generation.sync_weights()
-                self._last_loaded_step = self.state.global_step
+            # Sync weights if training step changed.
+            # When async_prefetch is enabled, weight sync is handled by _produce_data
+            # on the main thread before the background generation starts, so skip here
+            # to avoid racing with concurrent gradient updates.
+            if not getattr(self.args, "async_prefetch", False):
+                if self.state.global_step != self._last_loaded_step:
+                    with profiling_context(self, "sync_weights"):
+                        self.vllm_generation.sync_weights()
+                    self._last_loaded_step = self.state.global_step
 
             # Generate using vLLM
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
@@ -2305,6 +2374,10 @@ class GRPOTrainer(BaseTrainer):
             # Signal that old_per_token_logps (and possibly ref_per_token_logps / IS ratio)
             # must be computed on the main thread before the loss step.
             output["_deferred_logps"] = torch.tensor(True)
+            # Store per-function rewards (local slice) so that advantages can be
+            # recomputed during _materialize_deferred_logps with the full gathered
+            # rewards_per_func, ensuring group normalization is consistent.
+            output["_rewards_per_func"] = rewards_per_func[process_slice]
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction and not defer_model_logps:
