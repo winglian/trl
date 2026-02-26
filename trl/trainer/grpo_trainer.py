@@ -619,6 +619,7 @@ class GRPOTrainer(BaseTrainer):
             num_iterations=args.num_iterations,
             async_prefetch=args.async_prefetch,
             prefetch_depth=args.prefetch_depth,
+            sync_warmup_rollouts=args.sync_warmup_rollouts,
             # GRPO manages eval/train mode switching internally in
             # _generate_and_score_completions; don't let _produce_data
             # switch to eval which would confuse the train/eval dispatch.
@@ -998,6 +999,25 @@ class GRPOTrainer(BaseTrainer):
         that the background generation uses a consistent snapshot of the model.
         """
         if self.use_vllm and getattr(self.args, "async_prefetch", False):
+            # If a prefetched rollout is still generating, syncing vLLM weights now can
+            # mutate the engine while that in-flight request is running. Wait for the
+            # next queued rollout to finish first so the subsequent prefetch starts from
+            # a clean, synchronized snapshot.
+            try:
+                from transformers.data_producer import AsyncDataProducer
+            except Exception:
+                AsyncDataProducer = None
+
+            if AsyncDataProducer is not None and isinstance(self.data_producer, AsyncDataProducer):
+                queue = getattr(self.data_producer, "_queue", None)
+                if queue:
+                    # `AsyncDataProducer` uses a single-worker executor, but with
+                    # prefetch_depth > 1 a deeper future can start immediately
+                    # after the first one finishes. Wait for queued futures so
+                    # weight sync cannot overlap with in-flight generation.
+                    for future in list(queue):
+                        future.result()
+
             if self.state.global_step != self._last_loaded_step:
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
