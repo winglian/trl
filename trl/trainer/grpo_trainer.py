@@ -999,9 +999,18 @@ class GRPOTrainer(BaseTrainer):
         """
         if self.use_vllm and getattr(self.args, "async_prefetch", False):
             if self.state.global_step != self._last_loaded_step:
+                logger.info(
+                    f"_produce_data: syncing vLLM weights at global_step={self.state.global_step} "
+                    f"(last_loaded_step={self._last_loaded_step})"
+                )
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
+            else:
+                logger.info(
+                    f"_produce_data: skipping vLLM weight sync (global_step={self.state.global_step} "
+                    f"== last_loaded_step={self._last_loaded_step})"
+                )
         return super()._produce_data(model)
 
     def _materialize_deferred_logps(self, dataset) -> None:
@@ -1028,6 +1037,14 @@ class GRPOTrainer(BaseTrainer):
         data = dataset._data
         if "_deferred_logps" not in data:
             return
+
+        logger.info(
+            f"_materialize_deferred_logps: dataset has {len(dataset)} samples, "
+            f"keys={list(data.keys())}, "
+            f"advantages min={data['advantages'].min().item():.4f} max={data['advantages'].max().item():.4f} "
+            f"mean={data['advantages'].mean().item():.4f}, "
+            f"has _rewards_per_func={'_rewards_per_func' in data}"
+        )
 
         prompt_ids = data["prompt_ids"]
         prompt_mask = data["prompt_mask"]
@@ -1196,6 +1213,14 @@ class GRPOTrainer(BaseTrainer):
         for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
             if key in data:
                 dataset._shared_keys.discard(key)
+
+        logger.info(
+            f"_materialize_deferred_logps done: "
+            f"advantages min={data['advantages'].min().item():.4f} max={data['advantages'].max().item():.4f} "
+            f"mean={data['advantages'].mean().item():.4f}, "
+            f"has old_per_token_logps={'old_per_token_logps' in data}, "
+            f"has importance_sampling_ratio={'importance_sampling_ratio' in data}"
+        )
 
     def _get_online_dataloader(self, dataset) -> DataLoader:
         """Create a DataLoader for a RolloutDataset produced by the DataProducer.
@@ -2245,6 +2270,14 @@ class GRPOTrainer(BaseTrainer):
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
         rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        if mode == "train":
+            import threading
+            logger.info(
+                f"_generate_and_score_completions [{threading.current_thread().name}]: "
+                f"rewards_per_func shape={rewards_per_func.shape}, "
+                f"per-func means={rewards_per_func.nanmean(dim=0).tolist()}, "
+                f"defer_model_logps={defer_model_logps}"
+            )
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
         if self.multi_objective_aggregation == "sum_then_normalize":
