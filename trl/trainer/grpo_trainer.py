@@ -1058,27 +1058,15 @@ class GRPOTrainer(_BaseTrainer):
                     logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                 )
 
-            # 2. Compute IS ratio (if vLLM + IS correction)
-            if self.use_vllm and self.vllm_importance_sampling_correction and "sampling_per_token_logps" in data:
-                old_logps = data.get("old_per_token_logps")
-                if old_logps is not None:
-                    completion_mask = data["completion_mask"]
-                    tool_mask = data.get("tool_mask")
-                    mask = completion_mask if tool_mask is None else completion_mask * tool_mask
-                    per_token_logps_diff = (old_logps - data["sampling_per_token_logps"]) * mask
-
-                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                    if sequence_level_is:
-                        logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                    else:
-                        logps_diff = per_token_logps_diff
-
-                    ratio = torch.exp(logps_diff)
-                    if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                        ratio = torch.clamp(ratio, max=self.vllm_importance_sampling_cap)
-                    elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                        ratio = ratio.masked_fill(ratio > self.vllm_importance_sampling_cap, value=0.0)
-                    data["importance_sampling_ratio"] = ratio
+            # 2. Skip vLLM IS ratio for async rollouts.
+            #
+            # The vLLM IS ratio corrects for small numerical differences between
+            # vLLM and PyTorch at the *same* checkpoint.  In async mode the model
+            # has advanced K steps since the rollout was generated, so
+            #   ratio = exp(old_logps[step N+K] - sampling_logps[step N])
+            # is large and gets masked/clamped to ~0, killing the loss signal.
+            # The PPO clipping ratio (per_token_logps - old_per_token_logps)
+            # already handles the off-policy correction gracefully.
 
             # 3. Compute ref_per_token_logps (if beta != 0)
             if self.beta != 0.0:
@@ -1103,7 +1091,7 @@ class GRPOTrainer(_BaseTrainer):
         dataset._shared_keys.discard("_pending_policy_logps")
 
         # 5. Register newly added per-sample tensors so __getitem__ picks them up.
-        for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
+        for key in ("old_per_token_logps", "ref_per_token_logps"):
             dataset._shared_keys.discard(key)
             if key in data:
                 dataset._sample_keys.add(key)
@@ -2346,7 +2334,7 @@ class GRPOTrainer(_BaseTrainer):
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if self.use_vllm and self.vllm_importance_sampling_correction and "importance_sampling_ratio" in inputs:
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
