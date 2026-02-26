@@ -1097,8 +1097,10 @@ class GRPOTrainer(_BaseTrainer):
                             logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                         )
 
-        # 4. Remove sentinel
+        # 4. Remove sentinel from both the data dict and the shared-keys set
+        #    so __getitem__ doesn't try to look it up.
         del data["_pending_policy_logps"]
+        dataset._shared_keys.discard("_pending_policy_logps")
 
         # 5. Newly added per-sample tensors must not be in _shared_keys.
         for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
