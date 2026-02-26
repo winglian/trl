@@ -1102,9 +1102,11 @@ class GRPOTrainer(_BaseTrainer):
         del data["_pending_policy_logps"]
         dataset._shared_keys.discard("_pending_policy_logps")
 
-        # 5. Newly added per-sample tensors must not be in _shared_keys.
+        # 5. Register newly added per-sample tensors so __getitem__ picks them up.
         for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
             dataset._shared_keys.discard(key)
+            if key in data:
+                dataset._sample_keys.add(key)
 
     # -- End DataProducer overrides -------------------------------------------
 
