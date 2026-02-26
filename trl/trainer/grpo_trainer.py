@@ -1033,11 +1033,14 @@ class GRPOTrainer(BaseTrainer):
         from .grpo_data_producer import RolloutDataset
 
         if not isinstance(dataset, RolloutDataset):
+            print(f"[MATERIALIZE] SKIPPED: dataset is not RolloutDataset (type={type(dataset).__name__})", flush=True)
             return
         data = dataset._data
         if "_deferred_logps" not in data:
+            print(f"[MATERIALIZE] SKIPPED: _deferred_logps not in data (keys={list(data.keys())})", flush=True)
             return
 
+        print(f"[MATERIALIZE] RUNNING: {len(dataset)} samples, step={self.state.global_step}", flush=True)
         logger.info(
             f"_materialize_deferred_logps: dataset has {len(dataset)} samples, "
             f"keys={list(data.keys())}, "
@@ -1433,6 +1436,7 @@ class GRPOTrainer(BaseTrainer):
                 # thread.  This avoids a race condition where the background thread would
                 # read model weights while the main thread updates them during training.
                 if inputs.get("_deferred_logps") is not None:
+                    print(f"[DEFERRED-PER-BATCH] Computing deferred logps per-batch at step={self._step}", flush=True)
                     inputs = self._compute_deferred_logps(inputs)
 
                 return inputs
