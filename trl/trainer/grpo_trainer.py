@@ -1070,78 +1070,101 @@ class GRPOTrainer(BaseTrainer):
             needs_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             )
+            sampling_as_old = self.use_vllm and "sampling_per_token_logps" in data
+            if sampling_as_old:
+                # In async-prefetch rollouts, recomputing old_logps from the current
+                # training model can be much more off-policy than the actual sampling
+                # policy used by vLLM. Use sampling logprobs as π_old.
+                data["old_per_token_logps"] = data["sampling_per_token_logps"]
 
-            if needs_old_logps:
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
-                data["old_per_token_logps"] = old_per_token_logps
-
-            # Compute importance sampling ratio for vLLM
-            if (
-                self.use_vllm
-                and self.vllm_importance_sampling_correction
-                and "old_per_token_logps" in data
-                and "sampling_per_token_logps" in data
-            ):
-                tool_mask = data.get("tool_mask")
-                mask = completion_mask if tool_mask is None else completion_mask * data["tool_mask"]
-                per_token_logps_diff = (data["old_per_token_logps"] - data["sampling_per_token_logps"]) * mask
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                else:
-                    logps_diff = per_token_logps_diff
-
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                if self.vllm_importance_sampling_correction:
+                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        data["importance_sampling_ratio"] = torch.ones(
+                            (data["sampling_per_token_logps"].size(0), 1),
+                            device=data["sampling_per_token_logps"].device,
+                            dtype=data["sampling_per_token_logps"].dtype,
+                        )
+                    else:
+                        data["importance_sampling_ratio"] = torch.ones_like(data["sampling_per_token_logps"])
+            else:
+                if needs_old_logps:
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
                     )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    data["old_per_token_logps"] = old_per_token_logps
+
+                # Compute importance sampling ratio for vLLM
+                if (
+                    self.use_vllm
+                    and self.vllm_importance_sampling_correction
+                    and "old_per_token_logps" in data
+                    and "sampling_per_token_logps" in data
+                ):
+                    tool_mask = data.get("tool_mask")
+                    mask = completion_mask if tool_mask is None else completion_mask * data["tool_mask"]
+                    per_token_logps_diff = (data["old_per_token_logps"] - data["sampling_per_token_logps"]) * mask
+
+                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    else:
+                        logps_diff = per_token_logps_diff
+
+                    vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                    if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                        vllm_importance_sampling_ratio = torch.clamp(
+                            vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                        )
+                    elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                        vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                            vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                        )
+
+                    data["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+
+                    # Log IS / sampling metrics (same as _generate_and_score_completions)
+                    device = data["old_per_token_logps"].device
+                    delta = torch.abs(data["old_per_token_logps"] - data["sampling_per_token_logps"])
+                    bool_mask = mask.bool()
+                    delta_masked = delta[bool_mask]
+                    mean_delta = (
+                        torch.mean(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
                     )
-
-                data["importance_sampling_ratio"] = vllm_importance_sampling_ratio
-
-                # Log IS / sampling metrics (same as _generate_and_score_completions)
-                device = data["old_per_token_logps"].device
-                delta = torch.abs(data["old_per_token_logps"] - data["sampling_per_token_logps"])
-                bool_mask = mask.bool()
-                delta_masked = delta[bool_mask]
-                mean_delta = torch.mean(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
-                max_delta = torch.max(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
-                    self.accelerator.gather(mean_delta).mean().item()
-                )
-                self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
-                    self.accelerator.gather(max_delta).max().item()
-                )
-                if sequence_level_is:
-                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-                else:
-                    flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
-                min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                mean_is = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
-                    nanmin(self.accelerator.gather(min_is)).item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
-                    self.accelerator.gather(mean_is).nanmean().item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
-                    nanmax(self.accelerator.gather(max_is)).item()
-                )
+                    max_delta = (
+                        torch.max(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
+                    )
+                    self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
+                        self.accelerator.gather(mean_delta).mean().item()
+                    )
+                    self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
+                        self.accelerator.gather(max_delta).max().item()
+                    )
+                    if sequence_level_is:
+                        flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                    else:
+                        flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
+                    min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    mean_is = (
+                        torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    )
+                    max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
+                        nanmin(self.accelerator.gather(min_is)).item()
+                    )
+                    self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
+                        self.accelerator.gather(mean_is).nanmean().item()
+                    )
+                    self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
+                        nanmax(self.accelerator.gather(max_is)).item()
+                    )
 
             # Compute ref_per_token_logps for PEFT adapter path
             if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in data:
@@ -1435,82 +1458,99 @@ class GRPOTrainer(BaseTrainer):
         num_images = inputs.get("num_images")
 
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-            # Compute old_per_token_logps
             generate_every = self.args.steps_per_generation * self.num_iterations
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+            needs_old_logps = self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
-                inputs["old_per_token_logps"] = old_per_token_logps
+            )
 
-            # Compute importance sampling ratio for vLLM
-            if (
-                self.use_vllm
-                and self.vllm_importance_sampling_correction
-                and "old_per_token_logps" in inputs
-                and "sampling_per_token_logps" in inputs
-            ):
-                tool_mask = inputs.get("tool_mask")
-                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
-                per_token_logps_diff = (inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"]) * mask
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                else:
-                    logps_diff = per_token_logps_diff
-
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+            sampling_as_old = self.use_vllm and "sampling_per_token_logps" in inputs
+            if sampling_as_old:
+                inputs["old_per_token_logps"] = inputs["sampling_per_token_logps"]
+                if self.vllm_importance_sampling_correction:
+                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        inputs["importance_sampling_ratio"] = torch.ones(
+                            (inputs["sampling_per_token_logps"].size(0), 1),
+                            device=inputs["sampling_per_token_logps"].device,
+                            dtype=inputs["sampling_per_token_logps"].dtype,
+                        )
+                    else:
+                        inputs["importance_sampling_ratio"] = torch.ones_like(inputs["sampling_per_token_logps"])
+            else:
+                if needs_old_logps:
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
                     )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    inputs["old_per_token_logps"] = old_per_token_logps
+
+                # Compute importance sampling ratio for vLLM
+                if (
+                    self.use_vllm
+                    and self.vllm_importance_sampling_correction
+                    and "old_per_token_logps" in inputs
+                    and "sampling_per_token_logps" in inputs
+                ):
+                    tool_mask = inputs.get("tool_mask")
+                    mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+                    per_token_logps_diff = (inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"]) * mask
+
+                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    else:
+                        logps_diff = per_token_logps_diff
+
+                    vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                    if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                        vllm_importance_sampling_ratio = torch.clamp(
+                            vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                        )
+                    elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                        vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                            vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                        )
+
+                    inputs["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+
+                    # Log the same IS / sampling metrics that _generate_and_score_completions
+                    # would have logged if old_per_token_logps had not been deferred.
+                    device = inputs["old_per_token_logps"].device
+                    delta = torch.abs(inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"])
+                    bool_mask = mask.bool()
+                    delta = delta[bool_mask]
+                    mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                    max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+                    self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
+                        self.accelerator.gather(mean_delta).mean().item()
                     )
-
-                inputs["importance_sampling_ratio"] = vllm_importance_sampling_ratio
-
-                # Log the same IS / sampling metrics that _generate_and_score_completions
-                # would have logged if old_per_token_logps had not been deferred.
-                device = inputs["old_per_token_logps"].device
-                delta = torch.abs(inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"])
-                bool_mask = mask.bool()
-                delta = delta[bool_mask]
-                mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/sampling_logp_difference/mean"].append(
-                    self.accelerator.gather(mean_delta).mean().item()
-                )
-                self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
-                    self.accelerator.gather(max_delta).max().item()
-                )
-                if sequence_level_is:
-                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-                else:
-                    flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
-                min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                mean_is = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-                self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
-                    nanmin(self.accelerator.gather(min_is)).item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
-                    self.accelerator.gather(mean_is).nanmean().item()
-                )
-                self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
-                    nanmax(self.accelerator.gather(max_is)).item()
-                )
+                    self._metrics["train"]["sampling/sampling_logp_difference/max"].append(
+                        self.accelerator.gather(max_delta).max().item()
+                    )
+                    if sequence_level_is:
+                        flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                    else:
+                        flat_is_ratio = vllm_importance_sampling_ratio[bool_mask]
+                    min_is = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    mean_is = (
+                        torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    )
+                    max_is = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                    self._metrics["train"]["sampling/importance_sampling_ratio/min"].append(
+                        nanmin(self.accelerator.gather(min_is)).item()
+                    )
+                    self._metrics["train"]["sampling/importance_sampling_ratio/mean"].append(
+                        self.accelerator.gather(mean_is).nanmean().item()
+                    )
+                    self._metrics["train"]["sampling/importance_sampling_ratio/max"].append(
+                        nanmax(self.accelerator.gather(max_is)).item()
+                    )
 
             # Compute ref_per_token_logps for PEFT adapter path (uses self.model)
             if self.beta != 0.0 and self.ref_model is None and "ref_per_token_logps" not in inputs:
