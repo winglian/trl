@@ -71,6 +71,7 @@ from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
+from .grpo_data_producer import GRPODataProducer, RolloutDataset, make_rollout_collator
 from .utils import (
     RepeatSampler,
     create_model_from_path,
@@ -571,8 +572,8 @@ class GRPOTrainer(_BaseTrainer):
 
         if args.loss_type == "luspo" and args.importance_sampling_level != "sequence":
             logger.warning(
-                "When using `'luspo'` loss, `importance_sampling_level` should be set to `'sequence'` to mirror the "
-                "paper's setup."
+                "When using `’luspo’` loss, `importance_sampling_level` should be set to `’sequence’` to mirror the "
+                "paper’s setup."
             )
 
         # Multi-step
@@ -593,15 +594,50 @@ class GRPOTrainer(_BaseTrainer):
             args.gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
             args.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
 
+        # Build the DataProducer if opted in; otherwise use the legacy path.
+        data_producer = None
+        if args.use_data_producer:
+            from transformers.data_producer import ProducerConfig
+
+            if args.async_prefetch:
+                from transformers.data_producer import AsyncDataProducer
+
+            producer_config = ProducerConfig(
+                mini_epochs=args.num_iterations,
+                max_rollouts=None,  # bounded by max_steps
+                eval_during_produce=False,  # GRPO manages its own eval/train mode
+                empty_cache_before_produce=True,
+                empty_cache_after_produce=True,
+                async_prefetch=args.async_prefetch,
+                prefetch_depth=args.prefetch_depth,
+                sync_warmup_rollouts=args.sync_warmup_rollouts,
+            )
+            data_producer = GRPODataProducer(
+                config=producer_config,
+                prompt_dataset=train_dataset,
+                num_generations=self.num_generations,
+                generation_batch_size=args.generation_batch_size,
+                train_batch_size=args.per_device_train_batch_size,
+                steps_per_generation=args.steps_per_generation,
+                shuffle_dataset=self.shuffle_dataset,
+                seed=args.seed,
+            )
+            if args.async_prefetch:
+                data_producer = AsyncDataProducer(
+                    data_producer,
+                    background_produce_kwargs={"skip_policy_logps": True},
+                )
+
         super().__init__(
             model=model,
             args=args,
             data_collator=identity,  # No data collation is needed in GRPO
-            train_dataset=train_dataset,
+            train_dataset=train_dataset if data_producer is None else None,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
+            data_producer=data_producer,
             # In Trainer, `training_step` scales the loss by `gradient_accumulation_steps` only if `compute_loss_func`
             # is None. For DAPO, loss scaling instead depends on the total number of completions tokens across the
             # global accumulated batch. To control scaling ourselves, we must disable Trainer’s built-in scaling. The
@@ -609,6 +645,15 @@ class GRPOTrainer(_BaseTrainer):
             # that behavior without rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
         )
+
+        # Inject trainer reference into the data producer (needs accelerator, which is
+        # available only after super().__init__).
+        if self.data_producer is not None:
+            producer = self.data_producer
+            # Unwrap AsyncDataProducer to get the inner GRPODataProducer.
+            if hasattr(producer, "_inner"):
+                producer = producer._inner
+            producer.set_trainer(self)
 
         # Reference model
         self.beta = args.beta
@@ -930,6 +975,137 @@ class GRPOTrainer(_BaseTrainer):
             seed=self.args.seed,
         )
 
+    # -- DataProducer overrides -----------------------------------------------
+
+    def _produce_data(self, model):
+        """Override to handle vLLM weight sync and policy logprob computation.
+
+        Phase 1 (sync): delegates to the base implementation.
+        Phase 2 (async): syncs vLLM weights on the main thread *before* the
+        background produce call starts, then computes policy logprobs
+        after the dataset is returned.
+        """
+        if self.use_vllm and self.args.async_prefetch:
+            # Sync vLLM weights on the main thread before background work starts.
+            if self.state.global_step != self._last_loaded_step:
+                # Wait for in-flight background futures so we don't mutate the
+                # vLLM engine while an in-flight generation is running.
+                producer = self.data_producer
+                if hasattr(producer, "_queue"):
+                    for future in list(producer._queue):
+                        future.result()
+                with profiling_context(self, "sync_weights"):
+                    self.vllm_generation.sync_weights()
+                self._last_loaded_step = self.state.global_step
+
+        dataset = super()._produce_data(model)
+
+        # Compute policy logprobs on the main thread (Phase 2 / async).
+        if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
+            self._compute_policy_logps(dataset)
+
+        return dataset
+
+    def _get_online_dataloader(self, dataset):
+        """Create a DataLoader for a ``RolloutDataset`` produced by the data producer.
+
+        Unlike the base implementation, we do **not** call ``accelerator.prepare``
+        because the data is already per-process and on-device (tensors were created
+        in ``_generate_and_score_completions`` on the correct device).
+        """
+        if not isinstance(dataset, RolloutDataset):
+            return super()._get_online_dataloader(dataset)
+
+        return DataLoader(
+            dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            collate_fn=make_rollout_collator(dataset._shared_keys),
+            shuffle=False,  # Already shuffled in produce()
+        )
+
+    @torch.no_grad()
+    def _compute_policy_logps(self, dataset: RolloutDataset):
+        """Compute old/ref logprobs and IS ratio on the main thread for the full rollout.
+
+        Called after ``_produce_data`` returns a dataset whose ``_pending_policy_logps``
+        sentinel indicates that model forward passes were skipped during generation
+        (i.e. the rollout was produced on a background thread in async mode).
+        """
+        data = dataset._data
+        device = self.accelerator.device
+        batch_size = self.args.per_device_train_batch_size
+
+        prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
+        attention_mask = torch.cat([data["prompt_mask"], data["completion_mask"]], dim=1)
+        logits_to_keep = data["completion_ids"].size(1)
+
+        # Collect multimodal forward kwargs if present.
+        forward_kwargs = {}
+        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes", "token_type_ids", "mm_token_type_ids"):
+            if key in data:
+                forward_kwargs[key] = data[key]
+
+        num_images = data.get("num_images")
+
+        with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            # 1. Compute old_per_token_logps
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                data["old_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                    self.model, prompt_completion_ids, attention_mask,
+                    logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
+                )
+
+            # 2. Compute IS ratio (if vLLM + IS correction)
+            if self.use_vllm and self.vllm_importance_sampling_correction and "sampling_per_token_logps" in data:
+                old_logps = data.get("old_per_token_logps")
+                if old_logps is not None:
+                    completion_mask = data["completion_mask"]
+                    tool_mask = data.get("tool_mask")
+                    mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+                    per_token_logps_diff = (old_logps - data["sampling_per_token_logps"]) * mask
+
+                    sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    else:
+                        logps_diff = per_token_logps_diff
+
+                    ratio = torch.exp(logps_diff)
+                    if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                        ratio = torch.clamp(ratio, max=self.vllm_importance_sampling_cap)
+                    elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                        ratio = ratio.masked_fill(ratio > self.vllm_importance_sampling_cap, value=0.0)
+                    data["importance_sampling_ratio"] = ratio
+
+            # 3. Compute ref_per_token_logps (if beta != 0)
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model, prompt_completion_ids, attention_mask,
+                        logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
+                    )
+                else:
+                    # PEFT: disable adapters to get reference behaviour.
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    adapter_name = "ref" if "ref" in unwrapped.peft_config else None
+                    with use_adapter(unwrapped, adapter_name=adapter_name):
+                        data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                            self.model, prompt_completion_ids, attention_mask,
+                            logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
+                        )
+
+        # 4. Remove sentinel
+        del data["_pending_policy_logps"]
+
+        # 5. Newly added per-sample tensors must not be in _shared_keys.
+        for key in ("old_per_token_logps", "importance_sampling_ratio", "ref_per_token_logps"):
+            dataset._shared_keys.discard(key)
+
+    # -- End DataProducer overrides -------------------------------------------
+
     @profiling_decorator
     def _get_last_hidden_state(
         self,
@@ -1104,18 +1280,29 @@ class GRPOTrainer(_BaseTrainer):
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
         # During training:
-        #   - Receives the local generation batch (Per-GPU batch size × steps per generation)
-        #     from the modified training dataloader instead of the standard local batch
-        #   - Generates completions once for the entire generation batch and splits it into batches of size
-        #     `per_device_train_batch_size`
-        #   - Buffers these completions and returns the appropriate slice for the current accumulation step
-        #   - Optimizes by regenerating completions only periodically (every steps_per_generation * num_iterations)
+        #   - DataProducer path: data is already generated and batched by the RolloutDataset / DataLoader.
+        #     Just validate and pass through.
+        #   - Legacy path: Receives the local generation batch (Per-GPU batch size × steps per generation)
+        #     from the modified training dataloader instead of the standard local batch. Generates completions
+        #     once for the entire generation batch and splits it into batches of size `per_device_train_batch_size`.
+        #     Buffers these completions and returns the appropriate slice for the current accumulation step.
+        #     Optimizes by regenerating completions only periodically (every steps_per_generation * num_iterations).
         # During evaluation:
         #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
         #   - Completions are generated for each batch without buffering or reuse
         # Returns a single local batch in both cases.
 
         mode = "train" if self.model.training else "eval"
+
+        # DataProducer path: the RolloutDataset DataLoader already yields ready-to-train batches.
+        if mode == "train" and self.data_producer is not None:
+            assert "_pending_policy_logps" not in generation_batch, (
+                "Batch still has pending policy logps — _compute_policy_logps should have "
+                "been called on the full rollout before training started."
+            )
+            return generation_batch
+
+        # Legacy path (unchanged)
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
@@ -1222,8 +1409,10 @@ class GRPOTrainer(_BaseTrainer):
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
-            # Sync weights if training step changed
-            if self.state.global_step != self._last_loaded_step:
+            # Sync weights if training step changed.
+            # When async_prefetch is enabled, weight sync is handled by _produce_data
+            # on the main thread — skip here to avoid syncing from a background thread.
+            if not self.args.async_prefetch and self.state.global_step != self._last_loaded_step:
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
@@ -1592,7 +1781,7 @@ class GRPOTrainer(_BaseTrainer):
         )
 
     def _generate_and_score_completions(
-        self, inputs: list[dict[str, torch.Tensor | Any]]
+        self, inputs: list[dict[str, torch.Tensor | Any]], skip_policy_logps: bool = False,
     ) -> dict[str, torch.Tensor | Any]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
@@ -1720,8 +1909,9 @@ class GRPOTrainer(_BaseTrainer):
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
+            if not skip_policy_logps and (
+                self.args.gradient_accumulation_steps % generate_every != 0
+                or (self.use_vllm and self.vllm_importance_sampling_correction)
             ):
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
@@ -1736,7 +1926,7 @@ class GRPOTrainer(_BaseTrainer):
                 old_per_token_logps = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
+            if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
                 mask = completion_mask if tool_mask is None else completion_mask * tool_mask
                 per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
 
@@ -1767,7 +1957,7 @@ class GRPOTrainer(_BaseTrainer):
                     )
 
             # Compute the per-token log probabilities for the reference model
-            if self.beta != 0.0:
+            if not skip_policy_logps and self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
@@ -1889,7 +2079,7 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
             mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
             delta = delta[mask]
@@ -1935,7 +2125,7 @@ class GRPOTrainer(_BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
             output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
@@ -1957,6 +2147,8 @@ class GRPOTrainer(_BaseTrainer):
             output["num_images"] = num_images
         if tool_mask is not None:
             output["tool_mask"] = tool_mask
+        if skip_policy_logps:
+            output["_pending_policy_logps"] = True
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):

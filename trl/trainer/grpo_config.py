@@ -160,6 +160,23 @@ class GRPOConfig(_BaseConfig):
             Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory usage low, but
             waking the engine adds host–device transfer latency.
 
+        > Parameters that control the data producer (online rollout generation)
+
+        use_data_producer (`bool`, *optional*, defaults to `False`):
+            Use the ``DataProducer`` protocol for rollout generation instead of the legacy ``_prepare_inputs``
+            buffering path. When enabled, the trainer creates a ``GRPODataProducer`` that integrates with the
+            transformers ``_OnlineEpochSource`` for the training loop.
+        async_prefetch (`bool`, *optional*, defaults to `False`):
+            Enable asynchronous rollout prefetching. When ``True``, the next rollout is produced in a background
+            thread while the current one is being trained on. Requires ``use_data_producer=True``. Currently only
+            supported with a single process (``num_processes=1``).
+        prefetch_depth (`int`, *optional*, defaults to `1`):
+            Number of rollouts to produce ahead of training when ``async_prefetch`` is enabled. Higher values
+            keep the GPU more saturated but increase off-policy staleness.
+        sync_warmup_rollouts (`int`, *optional*, defaults to `0`):
+            Number of initial rollouts to produce synchronously before switching to async prefetch. During warmup,
+            each rollout is generated on-policy so the model can bootstrap learning from sparse reward signals.
+
         > Parameters that control the training
 
         beta (`float`, *optional*, defaults to `0.0`):
@@ -561,6 +578,39 @@ class GRPOConfig(_BaseConfig):
             "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
             "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
             "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
+    )
+
+    # Parameters that control the data producer (online rollout generation)
+    use_data_producer: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the DataProducer protocol for rollout generation instead of the legacy _prepare_inputs "
+            "buffering path. When enabled, the trainer creates a GRPODataProducer that integrates with the "
+            "transformers _OnlineEpochSource for the training loop."
+        },
+    )
+    async_prefetch: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable asynchronous rollout prefetching. When True, the next rollout is produced in a "
+            "background thread while the current one is being trained on. Requires use_data_producer=True. "
+            "Currently only supported with a single process."
+        },
+    )
+    prefetch_depth: int = field(
+        default=1,
+        metadata={
+            "help": "Number of rollouts to produce ahead of training when async_prefetch is enabled. Higher values "
+            "keep the GPU more saturated but increase off-policy staleness."
+        },
+    )
+    sync_warmup_rollouts: int = field(
+        default=0,
+        metadata={
+            "help": "Number of initial rollouts to produce synchronously before switching to async prefetch. "
+            "During warmup, each rollout is generated on-policy so the model can bootstrap learning from sparse "
+            "reward signals."
         },
     )
 
