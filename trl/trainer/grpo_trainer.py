@@ -997,8 +997,14 @@ class GRPOTrainer(BaseTrainer):
         generation work to a background thread.  The vLLM weight sync must happen on
         the main thread at a well-defined point (no concurrent gradient updates) so
         that the background generation uses a consistent snapshot of the model.
+
+        During sync warmup, generation is synchronous and weight sync is handled
+        by ``_generate_single_turn`` (same as the no-async path).
         """
-        if self.use_vllm and getattr(self.args, "async_prefetch", False):
+        async_active = self.use_vllm and getattr(self.args, "async_prefetch", False) and not getattr(
+            self.data_producer, "in_warmup", False
+        )
+        if async_active:
             if self.state.global_step != self._last_loaded_step:
                 logger.info(
                     f"_produce_data: syncing vLLM weights at global_step={self.state.global_step} "
@@ -1675,10 +1681,13 @@ class GRPOTrainer(BaseTrainer):
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
             # Sync weights if training step changed.
-            # When async_prefetch is enabled, weight sync is handled by _produce_data
-            # on the main thread before the background generation starts, so skip here
-            # to avoid racing with concurrent gradient updates.
-            if not getattr(self.args, "async_prefetch", False):
+            # When async_prefetch is active (not in warmup), weight sync is handled by
+            # _produce_data on the main thread before the background generation starts,
+            # so skip here to avoid racing with concurrent gradient updates.
+            async_active = getattr(self.args, "async_prefetch", False) and not getattr(
+                self.data_producer, "in_warmup", False
+            )
+            if not async_active:
                 if self.state.global_step != self._last_loaded_step:
                     with profiling_context(self, "sync_weights"):
                         self.vllm_generation.sync_weights()
@@ -2166,7 +2175,11 @@ class GRPOTrainer(BaseTrainer):
         # When async_prefetch is enabled, skip forward passes through self.model here because produce()
         # may run in a background thread concurrently with training.  These are deferred to
         # _compute_deferred_logps() which runs on the main thread before the loss computation.
-        defer_model_logps = getattr(self.args, "async_prefetch", False) and mode == "train"
+        # During sync warmup, generation is on-policy so we can compute logps immediately.
+        async_active = getattr(self.args, "async_prefetch", False) and not getattr(
+            self.data_producer, "in_warmup", False
+        )
+        defer_model_logps = async_active and mode == "train"
 
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
