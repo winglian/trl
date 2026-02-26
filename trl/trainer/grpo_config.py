@@ -416,6 +416,15 @@ class GRPOConfig(BaseConfig):
             "`steps_per_generation * num_iterations` optimizer steps of staleness. Default is 1 (one rollout ahead)."
         },
     )
+    sync_warmup_rollouts: int = field(
+        default=0,
+        metadata={
+            "help": "Number of initial rollouts to produce synchronously (on-policy) before switching to async "
+            "prefetch. During warmup, each rollout uses the latest model weights so the model can bootstrap "
+            "learning from sparse reward signals. After the warmup period, async prefetch resumes for maximum "
+            "throughput. Set to 0 (default) to disable warmup and use async prefetch from the start."
+        },
+    )
     temperature: float = field(
         default=1.0,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},

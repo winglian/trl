@@ -619,6 +619,7 @@ class GRPOTrainer(BaseTrainer):
             num_iterations=args.num_iterations,
             async_prefetch=args.async_prefetch,
             prefetch_depth=args.prefetch_depth,
+            sync_warmup_rollouts=args.sync_warmup_rollouts,
             # GRPO manages eval/train mode switching internally in
             # _generate_and_score_completions; don't let _produce_data
             # switch to eval which would confuse the train/eval dispatch.
