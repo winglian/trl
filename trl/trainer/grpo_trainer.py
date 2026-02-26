@@ -1052,8 +1052,7 @@ class GRPOTrainer(BaseTrainer):
             f"_materialize_deferred_logps: dataset has {len(dataset)} samples, "
             f"keys={list(data.keys())}, "
             f"advantages min={data['advantages'].min().item():.4f} max={data['advantages'].max().item():.4f} "
-            f"mean={data['advantages'].mean().item():.4f}, "
-            f"has _rewards_per_func={'_rewards_per_func' in data}"
+            f"mean={data['advantages'].mean().item():.4f}"
         )
 
         prompt_ids = data["prompt_ids"]
@@ -1165,55 +1164,9 @@ class GRPOTrainer(BaseTrainer):
                     )
                 data["ref_per_token_logps"] = ref_per_token_logps
 
-        # Recompute advantages from per-function rewards.
-        # The original advantages were computed at generation time using the stale policy's completions.
-        # While the rewards themselves are deterministic given the completions, recomputing here
-        # ensures group normalization uses the gathered rewards across all processes at a consistent
-        # point in training, and allows future extensions (e.g., reward reweighting).
-        if "_rewards_per_func" in data:
-            local_rewards_per_func = data["_rewards_per_func"]
-            rewards_per_func = gather(local_rewards_per_func)
-            num_generations = self.num_generations
-            device = local_rewards_per_func.device
-
-            if self.multi_objective_aggregation == "sum_then_normalize":
-                rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-                mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
-                mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
-                if self.scale_rewards in ["group", "none"]:
-                    if num_generations > 1:
-                        std_rewards = rewards.view(-1, num_generations).std(dim=1)
-                        std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
-                    else:
-                        std_rewards = torch.zeros_like(rewards)
-                elif self.scale_rewards == "batch":
-                    if rewards.numel() > 1:
-                        std_rewards = rewards.std().expand_as(rewards)
-                    else:
-                        std_rewards = torch.zeros_like(rewards)
-                advantages = rewards - mean_grouped_rewards
-                if self.scale_rewards != "none":
-                    advantages = advantages / (std_rewards + 1e-4)
-            elif self.multi_objective_aggregation == "normalize_then_sum":
-                grouped = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
-                mean_k = torch.nanmean(grouped, dim=1, keepdim=True)
-                std_k = nanstd(grouped, dim=1, keepdim=True) if num_generations > 1 else torch.zeros_like(mean_k)
-                reward_k = (grouped - mean_k) / (std_k + 1e-4)
-                reward_k = reward_k.view(-1, len(self.reward_funcs))
-                rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-                std_rewards = rewards.std().expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
-                advantages = (rewards - rewards.mean()) / (std_rewards + 1e-4)
-
-            # Slice to local process
-            process_slice = slice(
-                self.accelerator.process_index * len(local_rewards_per_func),
-                (self.accelerator.process_index + 1) * len(local_rewards_per_func),
-            )
-            data["advantages"] = advantages[process_slice]
-
-            # Clean up the temporary rewards storage
-            del data["_rewards_per_func"]
-            dataset._shared_keys.discard("_rewards_per_func")
+        # Advantages computed at generation time are kept as-is.  They depend
+        # only on the rewards (which are deterministic given completions) and
+        # the group structure, both of which are fixed once generation is done.
 
         # Remove the deferred sentinel — data is now fully materialized
         del data["_deferred_logps"]
@@ -2425,10 +2378,6 @@ class GRPOTrainer(BaseTrainer):
             # Signal that old_per_token_logps (and possibly ref_per_token_logps / IS ratio)
             # must be computed on the main thread before the loss step.
             output["_deferred_logps"] = torch.tensor(True)
-            # Store per-function rewards (local slice) so that advantages can be
-            # recomputed during _materialize_deferred_logps with the full gathered
-            # rewards_per_func, ensuring group normalization is consistent.
-            output["_rewards_per_func"] = rewards_per_func[process_slice]
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction and not defer_model_logps:
