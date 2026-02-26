@@ -277,7 +277,22 @@ class GRPODataProducer(BaseDataProducer):
             inputs, skip_policy_logps=skip_policy_logps
         )
 
+        # Strip non-sequence metadata before shuffling.  shuffle_sequence_dict
+        # expects every value to be a Tensor, list, or None — plain scalars
+        # (like the ``_pending_policy_logps: True`` sentinel or ``num_items_in_batch``)
+        # would cause a "not subscriptable" TypeError.
+        metadata = {}
+        for key in list(output.keys()):
+            val = output[key]
+            if not isinstance(val, (torch.Tensor, list)):
+                metadata[key] = output.pop(key)
+            elif isinstance(val, torch.Tensor) and val.dim() == 0:
+                metadata[key] = output.pop(key)
+
         # Shuffle to break prompt-group ordering before batching.
         output = shuffle_sequence_dict(output)
+
+        # Re-attach metadata that was stripped before the shuffle.
+        output.update(metadata)
 
         return RolloutDataset(output)
