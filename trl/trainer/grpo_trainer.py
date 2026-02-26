@@ -2153,10 +2153,16 @@ class GRPOTrainer(BaseTrainer):
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
         # Temporarily disable checkpointing to avoid this warning during inference.
-        # When async_prefetch is enabled, skip forward passes through self.model here because produce()
-        # may run in a background thread concurrently with training.  These are deferred to
-        # _compute_deferred_logps() which runs on the main thread before the loss computation.
-        defer_model_logps = getattr(self.args, "async_prefetch", False) and mode == "train"
+        #
+        # Defer self.model forward passes only when produce() is actually running in a background thread. During
+        # synchronous phases (no-async, async warmup, and first async call before the prefetch queue is active), we
+        # can safely compute these values inline and match no-async behavior.
+        in_background_produce_thread = threading.current_thread() is not threading.main_thread()
+        defer_model_logps = (
+            mode == "train"
+            and getattr(self.args, "async_prefetch", False)
+            and in_background_produce_thread
+        )
 
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
