@@ -1015,26 +1015,24 @@ class GRPOTrainer(_BaseTrainer):
         # advanced indexing) may still be in-flight when future.result() returns.
         # The main thread's CUDA stream has no implicit dependency on the background
         # stream, so we must synchronize the device to ensure all tensor data is
-        # valid before reading it for _compute_policy_logps or training.
+        # valid before reading it for _compute_deferred_scores or training.
         if self.args.async_prefetch and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        # Compute policy logprobs on the main thread (Phase 2 / async).
+        # Compute deferred scores on the main thread (Phase 2 / async).
+        # The BG thread only performed generation + tensor padding; we now
+        # compute rewards, advantages, policy logprobs, and metrics here.
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
             logger.info(
-                "[ASYNC_DIAG] _produce_data: materializing pending logps, "
+                "[ASYNC_DIAG] _produce_data: computing deferred scores, "
                 "dataset_size=%d, global_step=%d, keys=%s",
                 len(dataset), self.state.global_step,
                 sorted(dataset._data.keys()),
             )
-            self._compute_policy_logps(dataset)
-
-            # Accumulate metrics/logs for BG-produced rollouts on the main
-            # thread (the BG thread skips them to avoid thread-unsafe writes).
-            self._accumulate_bg_metrics(dataset)
+            self._compute_deferred_scores(dataset)
 
             logger.info(
-                "[ASYNC_DIAG] _produce_data: after _compute_policy_logps, "
+                "[ASYNC_DIAG] _produce_data: after _compute_deferred_scores, "
                 "sample_keys=%s, shared_keys=%s",
                 sorted(dataset._sample_keys), sorted(dataset._shared_keys),
             )
@@ -1059,40 +1057,119 @@ class GRPOTrainer(_BaseTrainer):
         )
 
     @torch.no_grad()
-    def _compute_policy_logps(self, dataset: RolloutDataset):
-        """Compute old/ref logprobs and IS ratio on the main thread for the full rollout.
+    @torch.no_grad()
+    def _compute_deferred_scores(self, dataset: RolloutDataset):
+        """Compute rewards, advantages, and policy logprobs on the main thread.
 
-        Called after ``_produce_data`` returns a dataset whose ``_pending_policy_logps``
-        sentinel indicates that model forward passes were skipped during generation
-        (i.e. the rollout was produced on a background thread in async mode).
+        Called after ``_produce_data`` returns a dataset whose
+        ``_pending_policy_logps`` sentinel indicates that the rollout was
+        produced on a background thread.  The BG thread only performed
+        generation + tensor padding; this method does all the scoring work
+        that was deferred.
         """
         data = dataset._data
         device = self.accelerator.device
         batch_size = self.args.per_device_train_batch_size
+        mode = "train"
 
+        # ---- 1. Recover deferred inputs for reward computation ----
+        inputs = data.pop("_deferred_inputs")
+        prompts = data.pop("_deferred_prompts")
+        completions = data.pop("_deferred_completions")
+        completion_ids_list = data.pop("_deferred_completion_ids_list")
+        for key in ("_deferred_inputs", "_deferred_prompts",
+                     "_deferred_completions", "_deferred_completion_ids_list"):
+            dataset._shared_keys.discard(key)
+            dataset._sample_keys.discard(key)
+
+        # ---- 2. Compute rewards and advantages ----
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        num_generations = self.num_generations
+
+        if self.multi_objective_aggregation == "sum_then_normalize":
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            if self.scale_rewards in ["group", "none"]:
+                if num_generations > 1:
+                    std_rewards = rewards.view(-1, num_generations).std(dim=1)
+                    std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+                else:
+                    std_rewards = torch.zeros_like(rewards)
+            elif self.scale_rewards == "batch":
+                if rewards.numel() > 1:
+                    std_rewards = rewards.std().expand_as(rewards)
+                else:
+                    std_rewards = torch.zeros_like(rewards)
+            else:
+                raise ValueError(
+                    f"Invalid value for scale_rewards: {self.scale_rewards}. "
+                    "Must be one of 'batch', 'group', or 'none'."
+                )
+            advantages = rewards - mean_grouped_rewards
+            if self.scale_rewards != "none":
+                advantages = advantages / (std_rewards + 1e-4)
+            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+
+        elif self.multi_objective_aggregation == "normalize_then_sum":
+            grouped = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
+            mean_k = torch.nanmean(grouped, dim=1, keepdim=True)
+            std_k = nanstd(grouped, dim=1, keepdim=True) if num_generations > 1 else torch.zeros_like(mean_k)
+            reward_k = (grouped - mean_k) / (std_k + 1e-4)
+            reward_k = reward_k.view(-1, len(self.reward_funcs))
+            rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            std_rewards = rewards.std().expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
+            advantages = (rewards - rewards.mean()) / (std_rewards + 1e-4)
+            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+        else:
+            raise ValueError(
+                f"Invalid multi_objective_aggregation: {self.multi_objective_aggregation}. "
+                "Must be 'sum_then_normalize' or 'normalize_then_sum'."
+            )
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # Replace placeholder advantages in the dataset
+        data["advantages"] = advantages
         logger.info(
-            "_compute_policy_logps: materialising deferred logps for %d samples "
-            "(advantages min=%.4f, max=%.4f, mean=%.4f)",
-            len(dataset),
-            data["advantages"].min().item(),
-            data["advantages"].max().item(),
-            data["advantages"].mean().item(),
+            "[ASYNC_DIAG] _compute_deferred_scores: rewards_mean=%.4f, "
+            "advantages min=%.4f, max=%.4f, mean=%.4f, num_samples=%d",
+            rewards_per_func.nansum(dim=1).mean().item(),
+            advantages.min().item(), advantages.max().item(),
+            advantages.mean().item(), len(advantages),
         )
 
+        # ---- 3. Accumulate reward metrics (main thread — safe) ----
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+                torch.nanmean(rewards_per_func[:, i]).item()
+            )
+            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(
+                nanstd(rewards_per_func[:, i]).item()
+            )
+        agg_rewards = rewards_per_func.nansum(dim=1)
+        self._metrics[mode]["reward"].append(agg_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(agg_rewards.std().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # ---- 4. Compute policy logprobs ----
         prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
         attention_mask = torch.cat([data["prompt_mask"], data["completion_mask"]], dim=1)
         logits_to_keep = data["completion_ids"].size(1)
 
-        # Collect multimodal forward kwargs if present.
         forward_kwargs = {}
-        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes", "token_type_ids", "mm_token_type_ids"):
+        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
+                     "image_sizes", "token_type_ids", "mm_token_type_ids"):
             if key in data:
                 forward_kwargs[key] = data[key]
-
         num_images = data.get("num_images")
 
         with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-            # 1. Compute old_per_token_logps
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
@@ -1102,17 +1179,10 @@ class GRPOTrainer(_BaseTrainer):
                     logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                 )
 
-            # 2. Skip vLLM IS ratio for async rollouts.
-            #
-            # The vLLM IS ratio corrects for small numerical differences between
-            # vLLM and PyTorch at the *same* checkpoint.  In async mode the model
-            # has advanced K steps since the rollout was generated, so
-            #   ratio = exp(old_logps[step N+K] - sampling_logps[step N])
-            # is large and gets masked/clamped to ~0, killing the loss signal.
-            # The PPO clipping ratio (per_token_logps - old_per_token_logps)
-            # already handles the off-policy correction gracefully.
+            # Skip vLLM IS ratio for async rollouts — the model has advanced
+            # since generation so the ratio is stale.  PPO clipping handles
+            # off-policy correction.
 
-            # 3. Compute ref_per_token_logps (if beta != 0)
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
@@ -1120,7 +1190,6 @@ class GRPOTrainer(_BaseTrainer):
                         logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                     )
                 else:
-                    # PEFT: disable adapters to get reference behaviour.
                     unwrapped = self.accelerator.unwrap_model(self.model)
                     adapter_name = "ref" if "ref" in unwrapped.peft_config else None
                     with use_adapter(unwrapped, adapter_name=adapter_name):
@@ -1129,69 +1198,21 @@ class GRPOTrainer(_BaseTrainer):
                             logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                         )
 
-        # 4. Remove sentinel from both the data dict and the shared-keys set
-        #    so __getitem__ doesn't try to look it up.
+        # ---- 5. Clean up sentinels & register new keys ----
         del data["_pending_policy_logps"]
         dataset._shared_keys.discard("_pending_policy_logps")
 
-        # 5. Register newly added per-sample tensors so __getitem__ picks them up.
         for key in ("old_per_token_logps", "ref_per_token_logps"):
             dataset._shared_keys.discard(key)
             if key in data:
                 dataset._sample_keys.add(key)
 
-    def _accumulate_bg_metrics(self, dataset: "RolloutDataset"):
-        """Accumulate reward metrics for a BG-produced rollout on the main thread.
-
-        The background thread skips ``self._metrics`` / ``self._logs`` writes
-        because they are not thread-safe (``gather_object`` uses
-        ``torch.distributed`` which corrupts internal state when called
-        concurrently).  We replay the metric accumulation here, on the main
-        thread, using the reward data stored in the dataset output dict
-        (``_bg_rewards_per_func``, ``_bg_is_std_zero``).
-        """
-        data = dataset._data
-        mode = "train"
-
-        rewards_per_func = data.get("_bg_rewards_per_func")
-        is_std_zero = data.get("_bg_is_std_zero")
-
-        if rewards_per_func is not None:
-            # Per-function reward metrics
-            for i, reward_func_name in enumerate(self.reward_func_names):
-                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-                std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-
-            # Aggregate reward metrics
-            rewards = rewards_per_func.nansum(dim=1)
-            self._metrics[mode]["reward"].append(rewards.mean().item())
-            self._metrics[mode]["reward_std"].append(rewards.std().item())
-
-            if is_std_zero is not None:
-                self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-
-            logger.info(
-                "[ASYNC_DIAG] _accumulate_bg_metrics: reward_mean=%.4f, reward_std=%.4f, "
-                "advantages min=%.4f, max=%.4f, mean=%.4f",
-                rewards.mean().item(), rewards.std().item(),
-                data["advantages"].min().item(), data["advantages"].max().item(),
-                data["advantages"].mean().item(),
-            )
-        else:
-            logger.warning(
-                "[ASYNC_DIAG] _accumulate_bg_metrics: no _bg_rewards_per_func found, "
-                "skipping reward metric accumulation"
-            )
-
-        # Clean up BG-only metadata keys from the dataset so they don't
-        # interfere with RolloutDataset / DataLoader (these are not training
-        # tensors and should not be iterated over or collated).
-        for key in ("_bg_rewards_per_func", "_bg_is_std_zero"):
-            data.pop(key, None)
-            dataset._shared_keys.discard(key)
-            dataset._sample_keys.discard(key)
+        # ---- 6. Shuffle (deferred from produce()) ----
+        # The BG thread skipped the shuffle so we could compute advantages
+        # with grouped prompt ordering.  Now that scoring is done, shuffle
+        # the dataset to break prompt-group correlation between mini-batches.
+        shuffled = shuffle_sequence_dict(data)
+        dataset._data = shuffled
 
     # -- End DataProducer overrides -------------------------------------------
 
@@ -1386,7 +1407,7 @@ class GRPOTrainer(_BaseTrainer):
         # DataProducer path: the RolloutDataset DataLoader already yields ready-to-train batches.
         if mode == "train" and self.data_producer is not None:
             assert "_pending_policy_logps" not in generation_batch, (
-                "Batch still has pending policy logps — _compute_policy_logps should have "
+                "Batch still has pending policy logps — _compute_deferred_scores should have "
                 "been called on the full rollout before training started."
             )
             return generation_batch
@@ -2170,6 +2191,43 @@ class GRPOTrainer(_BaseTrainer):
                     elif not isinstance(values, list):
                         inp[key] = values
 
+        # ---- BG thread early return: skip ALL scoring --------------------------
+        # When skip_policy_logps=True the code runs on a background thread.
+        # Rather than trying to make reward computation / advantage normalisation
+        # / distributed collectives thread-safe, we return the generation output
+        # immediately and defer *all* scoring to the main thread.
+        if skip_policy_logps:
+            output = {
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "completion_ids": completion_ids,
+                "completion_mask": completion_mask,
+                "num_items_in_batch": num_items_in_batch,
+                # Placeholder — replaced on the main thread by _compute_deferred_scores
+                "advantages": torch.zeros(completion_ids.size(0), device=device),
+                "_pending_policy_logps": True,
+                # Raw data for deferred reward / advantage computation
+                "_deferred_inputs": inputs,
+                "_deferred_prompts": prompts,
+                "_deferred_completions": completions,
+                "_deferred_completion_ids_list": completion_ids_list,
+            }
+            if sampling_per_token_logps is not None:
+                output["sampling_per_token_logps"] = sampling_per_token_logps
+            if tool_mask is not None:
+                output["tool_mask"] = tool_mask
+            if images is not None:
+                output["num_images"] = num_images
+            for k in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
+                       "image_sizes", "token_type_ids", "mm_token_type_ids"):
+                if k in forward_kwargs:
+                    output[k] = forward_kwargs[k]
+            logger.info(
+                "[ASYNC_DIAG] BG early return: %d samples, %d completions",
+                completion_ids.size(0), len(completions),
+            )
+            return output
+
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
@@ -2312,11 +2370,6 @@ class GRPOTrainer(_BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
-        # Store reward data for deferred metric accumulation on the main thread
-        # when running on a BG thread (skip_policy_logps=True).
-        if skip_policy_logps:
-            output["_bg_rewards_per_func"] = rewards_per_func
-            output["_bg_is_std_zero"] = is_std_zero
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
@@ -2341,8 +2394,6 @@ class GRPOTrainer(_BaseTrainer):
             output["num_images"] = num_images
         if tool_mask is not None:
             output["tool_mask"] = tool_mask
-        if skip_policy_logps:
-            output["_pending_policy_logps"] = True
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):

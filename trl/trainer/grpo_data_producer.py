@@ -297,14 +297,16 @@ class GRPODataProducer(BaseDataProducer):
                 metadata[key] = output.pop(key)
 
         # Shuffle to break prompt-group ordering before batching.
-        output = shuffle_sequence_dict(output)
+        # When skip_policy_logps=True (async path), we defer the shuffle to the
+        # main thread — _compute_deferred_scores needs grouped (unshuffled)
+        # ordering to normalise advantages per prompt group.
+        if not skip_policy_logps:
+            output = shuffle_sequence_dict(output)
 
         # When running on a background thread (skip_policy_logps=True → async),
-        # the shuffle above submits GPU operations (advanced indexing) to this
-        # thread's CUDA stream.  The main thread will consume the returned
-        # dataset on its *own* CUDA stream, which has no implicit dependency
-        # on our stream.  Synchronize the device so every tensor is fully
-        # materialised before the data crosses the thread boundary.
+        # tensor creation (padding etc.) was done on this thread's CUDA stream.
+        # Synchronize so all data is materialised before crossing the thread
+        # boundary.
         if skip_policy_logps and torch.cuda.is_available():
             torch.cuda.synchronize()
 
