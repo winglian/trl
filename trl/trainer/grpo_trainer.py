@@ -2246,21 +2246,24 @@ class GRPOTrainer(_BaseTrainer):
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)  # (B, 1)
 
     @staticmethod
-    def _select_opsm_sampling_logps(
+    def _select_opsm_logps_pair(
         inputs: dict[str, torch.Tensor | Any],
+        per_token_logps: torch.Tensor,
         old_per_token_logps: torch.Tensor,
-    ) -> torch.Tensor:
-        """Choose which logprobs OPSM should treat as the rollout policy.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Choose the (policy_logps, rollout_logps) pair used by OPSM KL.
 
-        For asynchronously prefetched rollouts, ``sampling_per_token_logps`` were
-        computed by an older behavior policy and can be much staler than
-        ``old_per_token_logps`` (materialized on the main thread right before
-        training this rollout). In that case, use ``old_per_token_logps`` to
-        avoid over-masking the policy gradient signal.
+        In stale async rollouts, ``sampling_per_token_logps`` come from an older
+        behavior policy. We still want OPSM to compare against those rollout
+        logprobs, but anchor the policy side at ``old_per_token_logps`` (frozen
+        right before training this rollout) instead of the ever-changing current
+        ``per_token_logps``. This keeps OPSM focused on rollout staleness rather
+        than intra-rollout policy updates.
         """
-        if bool(inputs.get("_rollout_policy_stale", False)):
-            return old_per_token_logps
-        return inputs.get("sampling_per_token_logps", old_per_token_logps)
+        rollout_logps = inputs.get("sampling_per_token_logps", old_per_token_logps)
+        is_stale_rollout = bool(inputs.get("_rollout_policy_stale", False)) and "sampling_per_token_logps" in inputs
+        policy_logps = old_per_token_logps if is_stale_rollout else per_token_logps
+        return policy_logps, rollout_logps
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
@@ -2307,12 +2310,14 @@ class GRPOTrainer(_BaseTrainer):
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
         if self.off_policy_mask_threshold is not None:
-            sampling_per_token_logps = self._select_opsm_sampling_logps(inputs, old_per_token_logps)
+            opsm_policy_logps, opsm_rollout_logps = self._select_opsm_logps_pair(
+                inputs, per_token_logps, old_per_token_logps
+            )
 
             off_policy_mask = self.get_off_policy_mask(
                 advantages=advantages,
-                per_token_logps=per_token_logps,
-                sampling_per_token_logps=sampling_per_token_logps,
+                per_token_logps=opsm_policy_logps,
+                sampling_per_token_logps=opsm_rollout_logps,
                 mask=mask,
                 off_policy_threshold=self.off_policy_mask_threshold,
             )
