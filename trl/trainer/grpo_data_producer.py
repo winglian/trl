@@ -306,4 +306,7 @@ class GRPODataProducer(BaseDataProducer):
         # Re-attach metadata that was stripped before the shuffle.
         output.update(metadata)
 
+        # Tag dataset with generation step for staleness tracking.
+        output["_generation_step"] = global_step
+
         return RolloutDataset(output)

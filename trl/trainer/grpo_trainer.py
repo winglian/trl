@@ -1062,6 +1062,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # ---- 2. Compute rewards and advantages ----
         rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        self._last_rewards_per_func = rewards_per_func  # Allow subclass access to raw rewards
         num_generations = self.num_generations
 
         if self.multi_objective_aggregation == "sum_then_normalize":
