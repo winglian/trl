@@ -1028,6 +1028,11 @@ class GRPOTrainer(_BaseTrainer):
                 sorted(dataset._data.keys()),
             )
             self._compute_policy_logps(dataset)
+
+            # Accumulate metrics/logs for BG-produced rollouts on the main
+            # thread (the BG thread skips them to avoid thread-unsafe writes).
+            self._accumulate_bg_metrics(dataset)
+
             logger.info(
                 "[ASYNC_DIAG] _produce_data: after _compute_policy_logps, "
                 "sample_keys=%s, shared_keys=%s",
@@ -1134,6 +1139,59 @@ class GRPOTrainer(_BaseTrainer):
             dataset._shared_keys.discard(key)
             if key in data:
                 dataset._sample_keys.add(key)
+
+    def _accumulate_bg_metrics(self, dataset: "RolloutDataset"):
+        """Accumulate reward metrics for a BG-produced rollout on the main thread.
+
+        The background thread skips ``self._metrics`` / ``self._logs`` writes
+        because they are not thread-safe (``gather_object`` uses
+        ``torch.distributed`` which corrupts internal state when called
+        concurrently).  We replay the metric accumulation here, on the main
+        thread, using the reward data stored in the dataset output dict
+        (``_bg_rewards_per_func``, ``_bg_is_std_zero``).
+        """
+        data = dataset._data
+        mode = "train"
+
+        rewards_per_func = data.get("_bg_rewards_per_func")
+        is_std_zero = data.get("_bg_is_std_zero")
+
+        if rewards_per_func is not None:
+            # Per-function reward metrics
+            for i, reward_func_name in enumerate(self.reward_func_names):
+                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+                std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+
+            # Aggregate reward metrics
+            rewards = rewards_per_func.nansum(dim=1)
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            self._metrics[mode]["reward_std"].append(rewards.std().item())
+
+            if is_std_zero is not None:
+                self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+            logger.info(
+                "[ASYNC_DIAG] _accumulate_bg_metrics: reward_mean=%.4f, reward_std=%.4f, "
+                "advantages min=%.4f, max=%.4f, mean=%.4f",
+                rewards.mean().item(), rewards.std().item(),
+                data["advantages"].min().item(), data["advantages"].max().item(),
+                data["advantages"].mean().item(),
+            )
+        else:
+            logger.warning(
+                "[ASYNC_DIAG] _accumulate_bg_metrics: no _bg_rewards_per_func found, "
+                "skipping reward metric accumulation"
+            )
+
+        # Clean up BG-only metadata keys from the dataset so they don't
+        # interfere with RolloutDataset / DataLoader (these are not training
+        # tensors and should not be iterated over or collated).
+        for key in ("_bg_rewards_per_func", "_bg_is_std_zero"):
+            data.pop(key, None)
+            dataset._shared_keys.discard(key)
+            dataset._sample_keys.discard(key)
 
     # -- End DataProducer overrides -------------------------------------------
 
@@ -1476,7 +1534,14 @@ class GRPOTrainer(_BaseTrainer):
 
     def _generate_single_turn(self, prompts: list):
         device = self.accelerator.device
-        mode = "train" if self.model.training else "eval"
+        # When called from a background thread (async DataProducer), reading
+        # self.model.training is racy — the main thread toggles it.  BG threads
+        # always produce training data, so force mode="train".
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            mode = "train"
+        else:
+            mode = "train" if self.model.training else "eval"
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
@@ -1762,7 +1827,14 @@ class GRPOTrainer(_BaseTrainer):
 
     def _generate(self, prompts: list):
         device = self.accelerator.device
-        mode = "train" if self.model.training else "eval"
+        # When called from a background thread (async DataProducer), reading
+        # self.model.training is racy — the main thread toggles it.
+        import threading
+        _on_bg_thread = threading.current_thread() is not threading.main_thread()
+        if _on_bg_thread:
+            mode = "train"
+        else:
+            mode = "train" if self.model.training else "eval"
 
         # Copy the prompts to avoid modifying the original list
         prompts = copy.deepcopy(prompts)
@@ -1810,29 +1882,31 @@ class GRPOTrainer(_BaseTrainer):
         total_prompt_tokens = agg_prompt_lengths.sum()
         total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
 
-        # Log the metrics
-        if mode == "train":
-            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
-        self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+        # Log the metrics.  Skip on BG threads to avoid racy writes to
+        # self.state / self._metrics while the main thread trains.
+        if not _on_bg_thread:
+            if mode == "train":
+                self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
+            self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-        # Log completion lengths, mean, min, max
-        self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+            # Log completion lengths, mean, min, max
+            self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with EOS and log their lengths
-        eos_and_pad = [self.eos_token_id, self.pad_token_id]
-        is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
-        agg_is_truncated = self.accelerator.gather(is_truncated)
-        self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
-        term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
-            term_completion_lengths = torch.zeros(1, device=device)
-        self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+            # Identify sequences that terminated with EOS and log their lengths
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
+            agg_is_truncated = self.accelerator.gather(is_truncated)
+            self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
+            term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
+            if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+                term_completion_lengths = torch.zeros(1, device=device)
+            self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        if self.tools:
+        if self.tools and not _on_bg_thread:
             agg_tool_call_count = self.accelerator.gather(torch.tensor(tool_call_count, device=device)).sum()
             tool_call_frequency = (agg_tool_call_count / len(agg_prompt_lengths)).item()
             self._metrics[mode]["tools/call_frequency"].append(tool_call_frequency)
@@ -1856,7 +1930,14 @@ class GRPOTrainer(_BaseTrainer):
         self, inputs: list[dict[str, torch.Tensor | Any]], skip_policy_logps: bool = False,
     ) -> dict[str, torch.Tensor | Any]:
         device = self.accelerator.device
-        mode = "train" if self.model.training else "eval"
+
+        # When skip_policy_logps=True this method runs on a background thread.
+        # Reading self.model.training is a race (the main thread toggles it),
+        # so force mode="train" — BG-produced data is always for training.
+        if skip_policy_logps:
+            mode = "train"
+        else:
+            mode = "train" if self.model.training else "eval"
 
         import threading
         logger.info(
@@ -2161,26 +2242,31 @@ class GRPOTrainer(_BaseTrainer):
             len(advantages),
         )
 
-        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-        for i, reward_func_name in enumerate(self.reward_func_names):
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        rewards = rewards_per_func.nansum(dim=1)
-        self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(rewards.std().item())
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+        # Accumulate metrics and logs.  When running on a background thread
+        # (skip_policy_logps=True) we must NOT mutate shared trainer state
+        # (self._metrics, self._logs) or call gather_object / distributed ops —
+        # they are NOT thread-safe and corrupt training on the main thread.
+        if not skip_policy_logps:
+            # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+            for i, reward_func_name in enumerate(self.reward_func_names):
+                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+                std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+            rewards = rewards_per_func.nansum(dim=1)
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            self._metrics[mode]["reward_std"].append(rewards.std().item())
+            self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        # Log prompt and completion texts
-        self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["completion"].extend(gather_object(completions_text))
-        for i, name in enumerate(self.reward_func_names):
-            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._logs["advantages"].extend(all_process_advantages.tolist())
+            # Log prompt and completion texts
+            self._logs["prompt"].extend(gather_object(prompts_text))
+            self._logs["completion"].extend(gather_object(completions_text))
+            for i, name in enumerate(self.reward_func_names):
+                self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+            self._logs["advantages"].extend(all_process_advantages.tolist())
 
-        if images is not None:
-            self._logs["images"].extend(gather_object(images))
+            if images is not None:
+                self._logs["images"].extend(gather_object(images))
 
         if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
@@ -2226,6 +2312,11 @@ class GRPOTrainer(_BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
+        # Store reward data for deferred metric accumulation on the main thread
+        # when running on a BG thread (skip_policy_logps=True).
+        if skip_policy_logps:
+            output["_bg_rewards_per_func"] = rewards_per_func
+            output["_bg_is_std_zero"] = is_std_zero
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if not skip_policy_logps and self.use_vllm and self.vllm_importance_sampling_correction:
