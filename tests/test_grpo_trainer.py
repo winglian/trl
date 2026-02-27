@@ -927,6 +927,28 @@ class TestGRPOTrainer(TrlTestCase):
 
         torch.testing.assert_close(off_policy_mask_keep, expected_mask_keep)
 
+    def test_select_opsm_sampling_logps(self):
+        old_per_token_logps = torch.full((2, 3), -1.0)
+        sampling_per_token_logps = torch.full((2, 3), -2.0)
+
+        # Async-prefetched rollouts should use old_per_token_logps to avoid
+        # over-masking from stale rollout-policy logprobs.
+        stale_inputs = {
+            "sampling_per_token_logps": sampling_per_token_logps,
+            "_rollout_policy_stale": True,
+        }
+        selected = GRPOTrainer._select_opsm_sampling_logps(stale_inputs, old_per_token_logps)
+        torch.testing.assert_close(selected, old_per_token_logps)
+
+        # Fresh rollouts should still prefer sampling_per_token_logps when present.
+        fresh_inputs = {"sampling_per_token_logps": sampling_per_token_logps}
+        selected = GRPOTrainer._select_opsm_sampling_logps(fresh_inputs, old_per_token_logps)
+        torch.testing.assert_close(selected, sampling_per_token_logps)
+
+        # Fallback: if sampling logprobs are missing, use old_per_token_logps.
+        selected = GRPOTrainer._select_opsm_sampling_logps({}, old_per_token_logps)
+        torch.testing.assert_close(selected, old_per_token_logps)
+
     def test_training_with_off_policy_mask(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 

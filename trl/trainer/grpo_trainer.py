@@ -2160,6 +2160,9 @@ class GRPOTrainer(_BaseTrainer):
             output["tool_mask"] = tool_mask
         if skip_policy_logps:
             output["_pending_policy_logps"] = True
+            # Mark batches produced asynchronously so OPSM can avoid using
+            # stale rollout-policy logprobs in the loss.
+            output["_rollout_policy_stale"] = True
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -2242,6 +2245,23 @@ class GRPOTrainer(_BaseTrainer):
         is_low_kl = avg_seq_kl <= off_policy_threshold
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)  # (B, 1)
 
+    @staticmethod
+    def _select_opsm_sampling_logps(
+        inputs: dict[str, torch.Tensor | Any],
+        old_per_token_logps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose which logprobs OPSM should treat as the rollout policy.
+
+        For asynchronously prefetched rollouts, ``sampling_per_token_logps`` were
+        computed by an older behavior policy and can be much staler than
+        ``old_per_token_logps`` (materialized on the main thread right before
+        training this rollout). In that case, use ``old_per_token_logps`` to
+        avoid over-masking the policy gradient signal.
+        """
+        if bool(inputs.get("_rollout_policy_stale", False)):
+            return old_per_token_logps
+        return inputs.get("sampling_per_token_logps", old_per_token_logps)
+
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -2287,11 +2307,7 @@ class GRPOTrainer(_BaseTrainer):
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
         if self.off_policy_mask_threshold is not None:
-            # OPSM should use inference-time logprobs to detect both sources of off-policyness:
-            # 1. Drift from gradient updates (always present)
-            # 2. Drift from training-inference mismatch (when using vLLM)
-            # When using vLLM, prioritize sampling_per_token_logps, otherwise use old_per_token_logps
-            sampling_per_token_logps = inputs.get("sampling_per_token_logps", old_per_token_logps)
+            sampling_per_token_logps = self._select_opsm_sampling_logps(inputs, old_per_token_logps)
 
             off_policy_mask = self.get_off_policy_mask(
                 advantages=advantages,
