@@ -1000,6 +1000,15 @@ class GRPOTrainer(_BaseTrainer):
 
         dataset = super()._produce_data(model)
 
+        # When the dataset was produced on a background thread (async prefetch),
+        # GPU operations from that thread's CUDA stream (e.g. shuffle_sequence_dict's
+        # advanced indexing) may still be in-flight when future.result() returns.
+        # The main thread's CUDA stream has no implicit dependency on the background
+        # stream, so we must synchronize the device to ensure all tensor data is
+        # valid before reading it for _compute_policy_logps or training.
+        if self.args.async_prefetch and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         # Compute policy logprobs on the main thread (Phase 2 / async).
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
             self._compute_policy_logps(dataset)
@@ -1034,6 +1043,15 @@ class GRPOTrainer(_BaseTrainer):
         data = dataset._data
         device = self.accelerator.device
         batch_size = self.args.per_device_train_batch_size
+
+        logger.info(
+            "_compute_policy_logps: materialising deferred logps for %d samples "
+            "(advantages min=%.4f, max=%.4f, mean=%.4f)",
+            len(dataset),
+            data["advantages"].min().item(),
+            data["advantages"].max().item(),
+            data["advantages"].mean().item(),
+        )
 
         prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
         attention_mask = torch.cat([data["prompt_mask"], data["completion_mask"]], dim=1)

@@ -292,6 +292,15 @@ class GRPODataProducer(BaseDataProducer):
         # Shuffle to break prompt-group ordering before batching.
         output = shuffle_sequence_dict(output)
 
+        # When running on a background thread (skip_policy_logps=True → async),
+        # the shuffle above submits GPU operations (advanced indexing) to this
+        # thread's CUDA stream.  The main thread will consume the returned
+        # dataset on its *own* CUDA stream, which has no implicit dependency
+        # on our stream.  Synchronize the device so every tensor is fully
+        # materialised before the data crosses the thread boundary.
+        if skip_policy_logps and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         # Re-attach metadata that was stripped before the shuffle.
         output.update(metadata)
 
