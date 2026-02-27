@@ -1011,7 +1011,18 @@ class GRPOTrainer(_BaseTrainer):
 
         # Compute policy logprobs on the main thread (Phase 2 / async).
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
+            logger.info(
+                "[ASYNC_DIAG] _produce_data: materializing pending logps, "
+                "dataset_size=%d, global_step=%d, keys=%s",
+                len(dataset), self.state.global_step,
+                sorted(dataset._data.keys()),
+            )
             self._compute_policy_logps(dataset)
+            logger.info(
+                "[ASYNC_DIAG] _produce_data: after _compute_policy_logps, "
+                "sample_keys=%s, shared_keys=%s",
+                sorted(dataset._sample_keys), sorted(dataset._shared_keys),
+            )
 
         return dataset
 
@@ -1797,6 +1808,14 @@ class GRPOTrainer(_BaseTrainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
+        import threading
+        logger.info(
+            "[ASYNC_DIAG] _generate_and_score_completions: mode=%s, model.training=%s, "
+            "skip_policy_logps=%s, thread=%s, num_inputs=%d",
+            mode, self.model.training, skip_policy_logps,
+            threading.current_thread().name, len(inputs),
+        )
+
         prompts = [x["prompt"] for x in inputs]
 
         if self.environments:
@@ -2001,6 +2020,16 @@ class GRPOTrainer(_BaseTrainer):
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
+        # --- ASYNC DIAGNOSTIC: log a few sample completions for verification ---
+        if self.data_producer is not None:
+            _label = "bg" if skip_policy_logps else "sync"
+            for _i in range(min(2, len(completions_text))):
+                _c = completions_text[_i] if isinstance(completions_text[_i], str) else str(completions_text[_i])
+                logger.info(
+                    "[ASYNC_DIAG] %s_completion[%d]: %s",
+                    _label, _i, _c[:200],
+                )
+
         # Merge extra_fields from rollout_func into inputs for reward functions
         if extra_fields:
             for i, inp in enumerate(inputs):
@@ -2068,6 +2097,19 @@ class GRPOTrainer(_BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+
+        # --- ASYNC DIAGNOSTIC: log rewards & advantages ---
+        _raw_rewards = rewards_per_func.nansum(dim=1)
+        _nonzero_frac = (_raw_rewards != 0).float().mean().item()
+        logger.info(
+            "[ASYNC_DIAG] rewards: mode=%s, skip_policy_logps=%s, "
+            "reward_mean=%.4f, reward_nonzero_frac=%.4f, "
+            "advantage_mean=%.4f, advantage_std=%.4f, num_samples=%d",
+            mode, skip_policy_logps,
+            _raw_rewards.mean().item(), _nonzero_frac,
+            advantages.mean().item(), advantages.std().item(),
+            len(advantages),
+        )
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -2302,6 +2344,22 @@ class GRPOTrainer(_BaseTrainer):
             )
 
         log_ratio = per_token_logps - old_per_token_logps
+
+        # --- ASYNC DIAGNOSTIC: log PPO ratio statistics ---
+        if self.data_producer is not None:
+            _masked_log_ratio = (log_ratio * mask).sum() / mask.sum().clamp(min=1.0)
+            logger.info(
+                "[ASYNC_DIAG] _compute_loss: has_old_logps=%s, "
+                "log_ratio_masked_mean=%.6f, advantage_mean=%.4f, advantage_nonzero_frac=%.4f, "
+                "old_logps_mean=%.4f, cur_logps_mean=%.4f",
+                "old_per_token_logps" in inputs,
+                _masked_log_ratio.item(),
+                advantages.mean().item(),
+                (advantages != 0).float().mean().item(),
+                (old_per_token_logps * mask).sum().item() / mask.sum().clamp(min=1.0).item(),
+                (per_token_logps * mask).sum().item() / mask.sum().clamp(min=1.0).item(),
+            )
+
         if self.importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == "sequence":
@@ -2381,6 +2439,16 @@ class GRPOTrainer(_BaseTrainer):
             loss = loss / normalizer
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # --- ASYNC DIAGNOSTIC: log loss value ---
+        if self.data_producer is not None:
+            logger.info(
+                "[ASYNC_DIAG] _compute_loss: loss=%.6f, coef_1_mean=%.6f, "
+                "has_IS_ratio=%s",
+                loss.item(),
+                coef_1.mean().item(),
+                "importance_sampling_ratio" in inputs,
+            )
 
         # Log the metrics
         completion_token_count = mask.sum().clamp(min=1.0)
