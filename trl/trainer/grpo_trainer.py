@@ -992,22 +992,12 @@ class GRPOTrainer(_BaseTrainer):
                 # vLLM engine while an in-flight generation is running.
                 producer = self.data_producer
                 if hasattr(producer, "_queue"):
-                    _q_len = len(producer._queue)
-                    _q_done = sum(1 for f in producer._queue if f.done())
-                    logger.info(
-                        "[ASYNC_DIAG] _produce_data: waiting for %d BG futures (%d already done), "
-                        "global_step=%d, _last_loaded_step=%d",
-                        _q_len, _q_done, self.state.global_step, self._last_loaded_step,
-                    )
                     for future in list(producer._queue):
                         future.result()
-                    logger.info("[ASYNC_DIAG] _produce_data: all BG futures completed, syncing weights")
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
-                logger.info("[ASYNC_DIAG] _produce_data: weight sync done, _last_loaded_step=%d", self._last_loaded_step)
 
-        logger.info("[ASYNC_DIAG] _produce_data: calling super()._produce_data, global_step=%d", self.state.global_step)
         dataset = super()._produce_data(model)
 
         # When the dataset was produced on a background thread (async prefetch),
@@ -1023,19 +1013,7 @@ class GRPOTrainer(_BaseTrainer):
         # The BG thread only performed generation + tensor padding; we now
         # compute rewards, advantages, policy logprobs, and metrics here.
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
-            logger.info(
-                "[ASYNC_DIAG] _produce_data: computing deferred scores, "
-                "dataset_size=%d, global_step=%d, keys=%s",
-                len(dataset), self.state.global_step,
-                sorted(dataset._data.keys()),
-            )
             self._compute_deferred_scores(dataset)
-
-            logger.info(
-                "[ASYNC_DIAG] _produce_data: after _compute_deferred_scores, "
-                "sample_keys=%s, shared_keys=%s",
-                sorted(dataset._sample_keys), sorted(dataset._shared_keys),
-            )
 
         return dataset
 
@@ -1136,13 +1114,6 @@ class GRPOTrainer(_BaseTrainer):
 
         # Replace placeholder advantages in the dataset
         data["advantages"] = advantages
-        logger.info(
-            "[ASYNC_DIAG] _compute_deferred_scores: rewards_mean=%.4f, "
-            "advantages min=%.4f, max=%.4f, mean=%.4f, num_samples=%d",
-            rewards_per_func.nansum(dim=1).mean().item(),
-            advantages.min().item(), advantages.max().item(),
-            advantages.mean().item(), len(advantages),
-        )
 
         # ---- 3. Accumulate reward metrics (main thread — safe) ----
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -1443,37 +1414,6 @@ class GRPOTrainer(_BaseTrainer):
 
         async_funcs_info = []  # async custom functions for asyncio.gather
 
-        # --- ASYNC DIAGNOSTIC: log actual reward function inputs ---
-        if self.data_producer is not None:
-            import threading
-            _thread = threading.current_thread().name
-            _n = len(prompts)
-            _keys_in_input = sorted(inputs[0].keys()) if inputs else []
-            _rk_keys = sorted(k for k in reward_kwargs if k != "trainer_state")
-            logger.info(
-                "[ASYNC_DIAG] _calculate_rewards: thread=%s, n_samples=%d, "
-                "input_keys=%s, reward_kwargs_keys=%s",
-                _thread, _n, _keys_in_input, _rk_keys,
-            )
-            for _si in range(min(2, _n)):
-                _p = prompts[_si]
-                _c = completions[_si]
-                # Handle conversational vs string prompts/completions
-                if isinstance(_p, list):
-                    _p_str = str(_p[-1].get("content", ""))[:120] if _p else ""
-                else:
-                    _p_str = str(_p)[:120]
-                if isinstance(_c, list):
-                    _c_str = str(_c[-1].get("content", ""))[:200] if _c else ""
-                else:
-                    _c_str = str(_c)[:200]
-                _answer = reward_kwargs.get("answer", [None] * _n)[_si] if "answer" in reward_kwargs else "N/A"
-                logger.info(
-                    "[ASYNC_DIAG] _calculate_rewards sample[%d]: "
-                    "prompt=%.120s | answer=%s | completion=%.200s",
-                    _si, _p_str, _answer, _c_str,
-                )
-
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
         ):
@@ -1506,15 +1446,6 @@ class GRPOTrainer(_BaseTrainer):
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-                    # --- ASYNC DIAGNOSTIC: log individual rewards ---
-                    if self.data_producer is not None:
-                        _nz = sum(1 for r in output_reward_func if r and r != 0 and r == r)
-                        logger.info(
-                            "[ASYNC_DIAG] reward_func[%s]: nonzero=%d/%d, first_5=%s",
-                            reward_func_name, _nz, len(output_reward_func),
-                            [float(r) if r == r else None for r in output_reward_func[:5]],
-                        )
 
         # Execute async custom functions in parallel using asyncio.gather
         if async_funcs_info:
@@ -1960,14 +1891,6 @@ class GRPOTrainer(_BaseTrainer):
         else:
             mode = "train" if self.model.training else "eval"
 
-        import threading
-        logger.info(
-            "[ASYNC_DIAG] _generate_and_score_completions: mode=%s, model.training=%s, "
-            "skip_policy_logps=%s, thread=%s, num_inputs=%d",
-            mode, self.model.training, skip_policy_logps,
-            threading.current_thread().name, len(inputs),
-        )
-
         prompts = [x["prompt"] for x in inputs]
 
         if self.environments:
@@ -2172,16 +2095,6 @@ class GRPOTrainer(_BaseTrainer):
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
-        # --- ASYNC DIAGNOSTIC: log a few sample completions for verification ---
-        if self.data_producer is not None:
-            _label = "bg" if skip_policy_logps else "sync"
-            for _i in range(min(2, len(completions_text))):
-                _c = completions_text[_i] if isinstance(completions_text[_i], str) else str(completions_text[_i])
-                logger.info(
-                    "[ASYNC_DIAG] %s_completion[%d]: %s",
-                    _label, _i, _c[:200],
-                )
-
         # Merge extra_fields from rollout_func into inputs for reward functions
         if extra_fields:
             for i, inp in enumerate(inputs):
@@ -2222,10 +2135,6 @@ class GRPOTrainer(_BaseTrainer):
                        "image_sizes", "token_type_ids", "mm_token_type_ids"):
                 if k in forward_kwargs:
                     output[k] = forward_kwargs[k]
-            logger.info(
-                "[ASYNC_DIAG] BG early return: %d samples, %d completions",
-                completion_ids.size(0), len(completions),
-            )
             return output
 
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
@@ -2286,19 +2195,6 @@ class GRPOTrainer(_BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
-
-        # --- ASYNC DIAGNOSTIC: log rewards & advantages ---
-        _raw_rewards = rewards_per_func.nansum(dim=1)
-        _nonzero_frac = (_raw_rewards != 0).float().mean().item()
-        logger.info(
-            "[ASYNC_DIAG] rewards: mode=%s, skip_policy_logps=%s, "
-            "reward_mean=%.4f, reward_nonzero_frac=%.4f, "
-            "advantage_mean=%.4f, advantage_std=%.4f, num_samples=%d",
-            mode, skip_policy_logps,
-            _raw_rewards.mean().item(), _nonzero_frac,
-            advantages.mean().item(), advantages.std().item(),
-            len(advantages),
-        )
 
         # Accumulate metrics and logs.  When running on a background thread
         # (skip_policy_logps=True) we must NOT mutate shared trainer state
@@ -2537,21 +2433,6 @@ class GRPOTrainer(_BaseTrainer):
 
         log_ratio = per_token_logps - old_per_token_logps
 
-        # --- ASYNC DIAGNOSTIC: log PPO ratio statistics ---
-        if self.data_producer is not None:
-            _masked_log_ratio = (log_ratio * mask).sum() / mask.sum().clamp(min=1.0)
-            logger.info(
-                "[ASYNC_DIAG] _compute_loss: has_old_logps=%s, "
-                "log_ratio_masked_mean=%.6f, advantage_mean=%.4f, advantage_nonzero_frac=%.4f, "
-                "old_logps_mean=%.4f, cur_logps_mean=%.4f",
-                "old_per_token_logps" in inputs,
-                _masked_log_ratio.item(),
-                advantages.mean().item(),
-                (advantages != 0).float().mean().item(),
-                (old_per_token_logps * mask).sum().item() / mask.sum().clamp(min=1.0).item(),
-                (per_token_logps * mask).sum().item() / mask.sum().clamp(min=1.0).item(),
-            )
-
         if self.importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == "sequence":
@@ -2631,16 +2512,6 @@ class GRPOTrainer(_BaseTrainer):
             loss = loss / normalizer
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        # --- ASYNC DIAGNOSTIC: log loss value ---
-        if self.data_producer is not None:
-            logger.info(
-                "[ASYNC_DIAG] _compute_loss: loss=%.6f, coef_1_mean=%.6f, "
-                "has_IS_ratio=%s",
-                loss.item(),
-                coef_1.mean().item(),
-                "importance_sampling_ratio" in inputs,
-            )
 
         # Log the metrics
         completion_token_count = mask.sum().clamp(min=1.0)

@@ -265,13 +265,6 @@ class GRPODataProducer(BaseDataProducer):
                 ``ref_per_token_logps``) and sets a ``_pending_policy_logps``
                 sentinel.  Used by ``AsyncDataProducer`` for background calls.
         """
-        import threading
-        logger.info(
-            "[ASYNC_DIAG] GRPODataProducer.produce: thread=%s, global_step=%d, "
-            "skip_policy_logps=%s",
-            threading.current_thread().name, global_step, skip_policy_logps,
-        )
-
         # Draw prompt batch (cycle on epoch exhaustion).
         try:
             inputs = next(self._prompt_iter)
