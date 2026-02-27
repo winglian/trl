@@ -1183,7 +1183,18 @@ class GRPOTrainer(_BaseTrainer):
         # The BG thread skipped the shuffle so we could compute advantages
         # with grouped prompt ordering.  Now that scoring is done, shuffle
         # the dataset to break prompt-group correlation between mini-batches.
+        # Strip non-sequence metadata before shuffle (same pattern as produce()).
+        # shuffle_sequence_dict expects every value to be a Tensor or list —
+        # plain scalars (int, bool, etc.) would cause a TypeError.
+        _metadata = {}
+        for key in list(data.keys()):
+            val = data[key]
+            if not isinstance(val, (torch.Tensor, list)):
+                _metadata[key] = data.pop(key)
+            elif isinstance(val, torch.Tensor) and val.dim() == 0:
+                _metadata[key] = data.pop(key)
         shuffled = shuffle_sequence_dict(data)
+        shuffled.update(_metadata)
         dataset._data = shuffled
 
     # -- End DataProducer overrides -------------------------------------------
