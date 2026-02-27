@@ -992,12 +992,22 @@ class GRPOTrainer(_BaseTrainer):
                 # vLLM engine while an in-flight generation is running.
                 producer = self.data_producer
                 if hasattr(producer, "_queue"):
+                    _q_len = len(producer._queue)
+                    _q_done = sum(1 for f in producer._queue if f.done())
+                    logger.info(
+                        "[ASYNC_DIAG] _produce_data: waiting for %d BG futures (%d already done), "
+                        "global_step=%d, _last_loaded_step=%d",
+                        _q_len, _q_done, self.state.global_step, self._last_loaded_step,
+                    )
                     for future in list(producer._queue):
                         future.result()
+                    logger.info("[ASYNC_DIAG] _produce_data: all BG futures completed, syncing weights")
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
+                logger.info("[ASYNC_DIAG] _produce_data: weight sync done, _last_loaded_step=%d", self._last_loaded_step)
 
+        logger.info("[ASYNC_DIAG] _produce_data: calling super()._produce_data, global_step=%d", self.state.global_step)
         dataset = super()._produce_data(model)
 
         # When the dataset was produced on a background thread (async prefetch),
@@ -1354,6 +1364,37 @@ class GRPOTrainer(_BaseTrainer):
 
         async_funcs_info = []  # async custom functions for asyncio.gather
 
+        # --- ASYNC DIAGNOSTIC: log actual reward function inputs ---
+        if self.data_producer is not None:
+            import threading
+            _thread = threading.current_thread().name
+            _n = len(prompts)
+            _keys_in_input = sorted(inputs[0].keys()) if inputs else []
+            _rk_keys = sorted(k for k in reward_kwargs if k != "trainer_state")
+            logger.info(
+                "[ASYNC_DIAG] _calculate_rewards: thread=%s, n_samples=%d, "
+                "input_keys=%s, reward_kwargs_keys=%s",
+                _thread, _n, _keys_in_input, _rk_keys,
+            )
+            for _si in range(min(2, _n)):
+                _p = prompts[_si]
+                _c = completions[_si]
+                # Handle conversational vs string prompts/completions
+                if isinstance(_p, list):
+                    _p_str = str(_p[-1].get("content", ""))[:120] if _p else ""
+                else:
+                    _p_str = str(_p)[:120]
+                if isinstance(_c, list):
+                    _c_str = str(_c[-1].get("content", ""))[:200] if _c else ""
+                else:
+                    _c_str = str(_c)[:200]
+                _answer = reward_kwargs.get("answer", [None] * _n)[_si] if "answer" in reward_kwargs else "N/A"
+                logger.info(
+                    "[ASYNC_DIAG] _calculate_rewards sample[%d]: "
+                    "prompt=%.120s | answer=%s | completion=%.200s",
+                    _si, _p_str, _answer, _c_str,
+                )
+
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
         ):
@@ -1386,6 +1427,15 @@ class GRPOTrainer(_BaseTrainer):
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+                    # --- ASYNC DIAGNOSTIC: log individual rewards ---
+                    if self.data_producer is not None:
+                        _nz = sum(1 for r in output_reward_func if r and r != 0 and r == r)
+                        logger.info(
+                            "[ASYNC_DIAG] reward_func[%s]: nonzero=%d/%d, first_5=%s",
+                            reward_func_name, _nz, len(output_reward_func),
+                            [float(r) if r == r else None for r in output_reward_func[:5]],
+                        )
 
         # Execute async custom functions in parallel using asyncio.gather
         if async_funcs_info:
