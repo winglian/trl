@@ -1051,7 +1051,7 @@ class GRPOTrainer(_BaseTrainer):
         data = dataset._data
         device = self.accelerator.device
         # Use larger batch for inference logprobs (no gradients needed, so can fit more)
-        batch_size = min(data["completion_ids"].size(0), self.args.per_device_train_batch_size * 16)
+        batch_size = min(data["completion_ids"].size(0), self.args.per_device_train_batch_size * 4)
         mode = "train"
 
         # ---- 1. Recover deferred data ----
