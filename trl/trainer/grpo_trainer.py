@@ -1069,13 +1069,31 @@ class GRPOTrainer(_BaseTrainer):
             dataset._shared_keys.discard(key)
             dataset._sample_keys.discard(key)
 
-        # ---- 2. Launch reward computation in BG thread (CPU-bound) ----
-        # This overlaps with GPU-bound policy logprob computation below.
-        def _compute_rewards_bg():
-            return self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        # ---- 2. Launch reward function calls in BG thread (CPU-bound) ----
+        # Only the pure-Python reward function calls run in the thread.
+        # CUDA tensor ops stay on the main thread to avoid thread-safety issues.
+        def _call_reward_funcs_bg():
+            """Run reward functions and return results as plain Python lists."""
+            keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+            reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+            reward_kwargs["trainer_state"] = self.state
+            results = []
+            for reward_func, reward_processing_class, reward_func_name in zip(
+                self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True
+            ):
+                if isinstance(reward_func, nn.Module) or asyncio.iscoroutinefunction(reward_func):
+                    # Module/async rewards need main thread — return None as placeholder
+                    results.append(None)
+                else:
+                    output = reward_func(
+                        prompts=prompts, completions=completions,
+                        completion_ids=completion_ids_list, **reward_kwargs
+                    )
+                    results.append([r if r is not None else float('nan') for r in output])
+            return results
 
         reward_executor = ThreadPoolExecutor(max_workers=1)
-        reward_future = reward_executor.submit(_compute_rewards_bg)
+        reward_future = reward_executor.submit(_call_reward_funcs_bg)
 
         # ---- 3. Compute policy logprobs (GPU-bound) ----
         prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
@@ -1116,9 +1134,25 @@ class GRPOTrainer(_BaseTrainer):
 
         _t_logprobs = _time.perf_counter()
 
-        # ---- 4. Wait for rewards and compute advantages ----
-        rewards_per_func = reward_future.result()
+        # ---- 4. Wait for reward results and build tensor on main thread ----
+        bg_reward_results = reward_future.result()
         reward_executor.shutdown(wait=False)
+
+        # Build rewards_per_func tensor from BG results (CUDA ops on main thread)
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        any_need_main_thread = False
+        for i, result in enumerate(bg_reward_results):
+            if result is not None:
+                rewards_per_func[:, i] = torch.tensor(result, dtype=torch.float32, device=device)
+            else:
+                any_need_main_thread = True
+
+        # Fall back to full _calculate_rewards if any funcs couldn't run in BG
+        if any_need_main_thread:
+            rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        else:
+            rewards_per_func = gather(rewards_per_func)
+
         num_generations = self.num_generations
 
         if self.multi_objective_aggregation == "sum_then_normalize":
