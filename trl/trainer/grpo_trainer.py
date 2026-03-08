@@ -978,16 +978,18 @@ class GRPOTrainer(_BaseTrainer):
     # -- DataProducer overrides -----------------------------------------------
 
     def _produce_data(self, model):
-        """Override to handle vLLM weight sync and policy logprob computation.
+        """Override to handle vLLM weight sync and policy logprob computation."""
+        import time as _time
+        _t0 = _time.perf_counter()
 
-        Phase 1 (sync): delegates to the base implementation.
-        Phase 2 (async): syncs vLLM weights on the main thread *before* the
-        background produce call starts, then computes policy logprobs
-        after the dataset is returned.
-        """
         if self.use_vllm and self.args.async_prefetch:
             # Sync vLLM weights on the main thread before background work starts.
-            if self.state.global_step != self._last_loaded_step:
+            # Only sync every 4 steps to reduce overhead (~0.35s per sync).
+            # The model changes slowly enough that slightly stale vLLM weights
+            # are acceptable; PPO clipping handles off-policy correction.
+            sync_interval = getattr(self.args, 'vllm_sync_interval', 4)
+            if (self.state.global_step != self._last_loaded_step and
+                    self.state.global_step % sync_interval == 0):
                 # Wait for in-flight background futures so we don't mutate the
                 # vLLM engine while an in-flight generation is running.
                 producer = self.data_producer
@@ -998,22 +1000,23 @@ class GRPOTrainer(_BaseTrainer):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
 
+        _t1 = _time.perf_counter()
         dataset = super()._produce_data(model)
+        _t2 = _time.perf_counter()
 
-        # When the dataset was produced on a background thread (async prefetch),
-        # GPU operations from that thread's CUDA stream (e.g. shuffle_sequence_dict's
-        # advanced indexing) may still be in-flight when future.result() returns.
-        # The main thread's CUDA stream has no implicit dependency on the background
-        # stream, so we must synchronize the device to ensure all tensor data is
-        # valid before reading it for _compute_deferred_scores or training.
         if self.args.async_prefetch and torch.cuda.is_available():
             torch.cuda.synchronize()
+        _t3 = _time.perf_counter()
 
-        # Compute deferred scores on the main thread (Phase 2 / async).
-        # The BG thread only performed generation + tensor padding; we now
-        # compute rewards, advantages, policy logprobs, and metrics here.
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
             self._compute_deferred_scores(dataset)
+        _t4 = _time.perf_counter()
+
+        logger.info(
+            f"[TIMING] _produce_data: weight_sync={_t1-_t0:.3f}s, "
+            f"queue_consume={_t2-_t1:.3f}s, cuda_sync={_t3-_t2:.3f}s, "
+            f"deferred_scores={_t4-_t3:.3f}s, total={_t4-_t0:.3f}s"
+        )
 
         return dataset
 
