@@ -975,6 +975,76 @@ class GRPOTrainer(_BaseTrainer):
             seed=self.args.seed,
         )
 
+    # -- Persistent reward subprocess ------------------------------------------
+
+    def _get_reward_worker(self):
+        """Return a persistent reward worker subprocess (lazy-initialized).
+
+        Instead of spawning a new multiprocessing.Process per step (~0.1s overhead),
+        we keep a long-lived worker that receives (reward_funcs, args) over a pipe
+        and sends back results.  The worker has its own main thread so
+        ``signal.alarm()`` (used by ``math_verify``) works correctly.
+        """
+        if hasattr(self, "_reward_worker_conn") and self._reward_worker_conn is not None:
+            # Already running – check if alive
+            if self._reward_worker_proc.is_alive():
+                return self._reward_worker_conn
+            else:
+                # Worker died, clean up and respawn
+                self._reward_worker_conn.close()
+                self._reward_worker_conn = None
+
+        import multiprocessing as _mp
+
+        parent_conn, child_conn = _mp.Pipe()
+
+        def _persistent_reward_worker(conn):
+            """Long-lived reward worker. Receives work items, returns results."""
+            import signal
+            while True:
+                try:
+                    msg = conn.recv()
+                except EOFError:
+                    break
+                if msg is None:  # Shutdown signal
+                    break
+                reward_funcs, prompts, completions, completion_ids_list, inputs, reward_func_names = msg
+                try:
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    results = []
+                    for reward_func, reward_func_name in zip(reward_funcs, reward_func_names, strict=True):
+                        output = reward_func(
+                            prompts=prompts, completions=completions,
+                            completion_ids=completion_ids_list, **reward_kwargs
+                        )
+                        results.append([float(r) if r is not None else float('nan') for r in output])
+                    conn.send(results)
+                except Exception:
+                    conn.send(None)
+
+        proc = _mp.Process(target=_persistent_reward_worker, args=(child_conn,), daemon=True)
+        proc.start()
+        child_conn.close()  # Parent doesn't need child end
+
+        self._reward_worker_conn = parent_conn
+        self._reward_worker_proc = proc
+        return parent_conn
+
+    def _shutdown_reward_worker(self):
+        """Shut down the persistent reward worker."""
+        if hasattr(self, "_reward_worker_conn") and self._reward_worker_conn is not None:
+            try:
+                self._reward_worker_conn.send(None)  # Shutdown signal
+                self._reward_worker_proc.join(timeout=5)
+            except Exception:
+                pass
+            try:
+                self._reward_worker_conn.close()
+            except Exception:
+                pass
+            self._reward_worker_conn = None
+
     # -- DataProducer overrides -----------------------------------------------
 
     def _produce_data(self, model):
@@ -1065,48 +1135,23 @@ class GRPOTrainer(_BaseTrainer):
             dataset._shared_keys.discard(key)
             dataset._sample_keys.discard(key)
 
-        # ---- 2. Launch reward computation in subprocess ----
+        # ---- 2. Launch reward computation in persistent subprocess ----
         # Reward functions like math_verify use signal.alarm() which only works
         # in the main thread. Using a subprocess gives it its own main thread.
-        # This overlaps CPU-bound reward computation with GPU-bound logprobs.
-        import multiprocessing as _mp
+        # A persistent worker avoids per-step process spawn/join overhead (~0.1s).
         _reward_can_bg = all(
             not isinstance(rf, nn.Module) and not asyncio.iscoroutinefunction(rf)
             for rf in self.reward_funcs
         )
-        _reward_proc = None
-        _reward_pipe = None
+        _reward_sent = False
+        _reward_conn = None
         if _reward_can_bg:
-            _parent_conn, _child_conn = _mp.Pipe()
-            def _reward_worker(conn, reward_funcs, prompts, completions, completion_ids_list, inputs, reward_func_names):
-                """Compute rewards in subprocess (has its own main thread for signal.alarm)."""
-                try:
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                    results = []
-                    for i, (reward_func, reward_func_name) in enumerate(
-                        zip(reward_funcs, reward_func_names, strict=True)
-                    ):
-                        output = reward_func(
-                            prompts=prompts, completions=completions,
-                            completion_ids=completion_ids_list, **reward_kwargs
-                        )
-                        results.append([float(r) if r is not None else float('nan') for r in output])
-                    conn.send(results)
-                except Exception as e:
-                    conn.send(None)  # Signal failure
-                finally:
-                    conn.close()
-
-            _reward_proc = _mp.Process(
-                target=_reward_worker,
-                args=(_child_conn, self.reward_funcs, prompts, completions,
-                      completion_ids_list, inputs, self.reward_func_names),
-                daemon=True,
-            )
-            _reward_proc.start()
-            _child_conn.close()  # Parent doesn't need the child end
-            _reward_pipe = _parent_conn
+            _reward_conn = self._get_reward_worker()
+            _reward_conn.send((
+                self.reward_funcs, prompts, completions,
+                completion_ids_list, inputs, self.reward_func_names,
+            ))
+            _reward_sent = True
 
         # ---- 3. Compute policy logprobs (GPU-bound, overlaps with BG rewards) ----
         prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
@@ -1150,10 +1195,8 @@ class GRPOTrainer(_BaseTrainer):
         _t_logprobs = _time.perf_counter()
 
         # ---- 4. Wait for rewards and compute advantages ----
-        if _reward_proc is not None:
-            bg_results = _reward_pipe.recv()
-            _reward_proc.join(timeout=10)
-            _reward_pipe.close()
+        if _reward_sent:
+            bg_results = _reward_conn.recv()
             if bg_results is not None:
                 rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
                 for i, result in enumerate(bg_results):
@@ -1163,7 +1206,7 @@ class GRPOTrainer(_BaseTrainer):
                 # Subprocess failed, fall back to main thread
                 rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         else:
-            # Non-picklable reward funcs: compute on main thread
+            # Non-picklable reward funcs (nn.Module or async): compute on main thread
             rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
 
         num_generations = self.num_generations
