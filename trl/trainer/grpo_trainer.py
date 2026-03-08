@@ -1047,28 +1047,39 @@ class GRPOTrainer(_BaseTrainer):
 
     # -- DataProducer overrides -----------------------------------------------
 
+    def _start_async_weight_sync(self):
+        """Launch weight sync to vLLM in a background thread.
+
+        The sync runs while training proceeds on the GPU, hiding the ~0.35s
+        NCCL transfer behind compute. Must be called after draining the async
+        queue (so no in-flight generations are running on vLLM).
+        """
+        import threading
+
+        def _do_sync():
+            import time as _t
+            _t0 = _t.perf_counter()
+            self.vllm_generation.sync_weights()
+            _t1 = _t.perf_counter()
+            logger.info(f"[TIMING] async_weight_sync completed in {_t1-_t0:.3f}s (background)")
+
+        self._weight_sync_thread = threading.Thread(target=_do_sync, daemon=True)
+        self._weight_sync_thread.start()
+
+    def _wait_for_weight_sync(self):
+        """Wait for any in-flight async weight sync to complete."""
+        if hasattr(self, "_weight_sync_thread") and self._weight_sync_thread is not None:
+            self._weight_sync_thread.join()
+            self._weight_sync_thread = None
+
     def _produce_data(self, model):
         """Override to handle vLLM weight sync and policy logprob computation."""
         import time as _time
         _t0 = _time.perf_counter()
 
-        if self.use_vllm and self.args.async_prefetch:
-            # Sync vLLM weights on the main thread before background work starts.
-            # Only sync every 4 steps to reduce overhead (~0.35s per sync).
-            # The model changes slowly enough that slightly stale vLLM weights
-            # are acceptable; PPO clipping handles off-policy correction.
-            sync_interval = getattr(self.args, 'vllm_sync_interval', 4)
-            if (self.state.global_step != self._last_loaded_step and
-                    self.state.global_step % sync_interval == 0):
-                # Wait for in-flight background futures so we don't mutate the
-                # vLLM engine while an in-flight generation is running.
-                producer = self.data_producer
-                if hasattr(producer, "_queue"):
-                    for future in list(producer._queue):
-                        future.result()
-                with profiling_context(self, "sync_weights"):
-                    self.vllm_generation.sync_weights()
-                self._last_loaded_step = self.state.global_step
+        # Wait for any async weight sync from the previous step
+        self._wait_for_weight_sync()
+        _t_sync_wait = _time.perf_counter()
 
         _t1 = _time.perf_counter()
         dataset = super()._produce_data(model)
@@ -1082,10 +1093,26 @@ class GRPOTrainer(_BaseTrainer):
             self._compute_deferred_scores(dataset)
         _t4 = _time.perf_counter()
 
+        # Launch async weight sync AFTER deferred scores, so it overlaps with training
+        if self.use_vllm and self.args.async_prefetch:
+            sync_interval = getattr(self.args, 'vllm_sync_interval', 4)
+            if (self.state.global_step != self._last_loaded_step and
+                    self.state.global_step % sync_interval == 0):
+                # Drain in-flight futures before syncing
+                producer = self.data_producer
+                if hasattr(producer, "_queue"):
+                    for future in list(producer._queue):
+                        future.result()
+                self._start_async_weight_sync()
+                self._last_loaded_step = self.state.global_step
+
+        _t5 = _time.perf_counter()
+
         logger.info(
-            f"[TIMING] _produce_data: weight_sync={_t1-_t0:.3f}s, "
+            f"[TIMING] _produce_data: sync_wait={_t_sync_wait-_t0:.3f}s, "
             f"queue_consume={_t2-_t1:.3f}s, cuda_sync={_t3-_t2:.3f}s, "
-            f"deferred_scores={_t4-_t3:.3f}s, total={_t4-_t0:.3f}s"
+            f"deferred_scores={_t4-_t3:.3f}s, async_sync_launch={_t5-_t4:.3f}s, "
+            f"total={_t5-_t0:.3f}s"
         )
 
         return dataset
@@ -1197,6 +1224,7 @@ class GRPOTrainer(_BaseTrainer):
         # ---- 4. Wait for rewards and compute advantages ----
         if _reward_sent:
             bg_results = _reward_conn.recv()
+            _t_reward_recv = _time.perf_counter()
             if bg_results is not None:
                 rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
                 for i, result in enumerate(bg_results):
@@ -1208,6 +1236,7 @@ class GRPOTrainer(_BaseTrainer):
         else:
             # Non-picklable reward funcs (nn.Module or async): compute on main thread
             rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+            _t_reward_recv = _time.perf_counter()
 
         num_generations = self.num_generations
 
@@ -1291,9 +1320,10 @@ class GRPOTrainer(_BaseTrainer):
         dataset._data = shuffled
 
         _t_end = _time.perf_counter()
+        _reward_wait_str = f", reward_wait={_t_reward_recv-_t_logprobs:.3f}s" if _reward_sent else ""
         logger.info(
             f"[TIMING] _compute_deferred_scores: "
-            f"policy_logprobs={_t_logprobs-_t_start:.3f}s, "
+            f"policy_logprobs={_t_logprobs-_t_start:.3f}s{_reward_wait_str}, "
             f"rewards+advantages={_t_rewards-_t_logprobs:.3f}s, "
             f"cleanup+shuffle={_t_end-_t_rewards:.3f}s, "
             f"total={_t_end-_t_start:.3f}s"
