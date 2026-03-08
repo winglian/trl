@@ -584,7 +584,6 @@ def main(script_args: ScriptArguments):
             "top_k": request.top_k,
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
-            "truncate_prompt_tokens": request.truncate_prompt_tokens,
             "logprobs": request.logprobs,
         }
         generation_kwargs.update(request.generation_kwargs)
@@ -751,7 +750,6 @@ def main(script_args: ScriptArguments):
             "top_k": request.top_k,
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
-            "truncate_prompt_tokens": request.truncate_prompt_tokens,
             "logprobs": request.logprobs,
         }
         generation_kwargs.update(request.generation_kwargs)
