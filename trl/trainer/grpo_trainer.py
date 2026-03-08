@@ -1046,12 +1046,8 @@ class GRPOTrainer(_BaseTrainer):
         produced on a background thread.  The BG thread only performed
         generation + tensor padding; this method does all the scoring work
         that was deferred.
-
-        Rewards are computed in a background thread (CPU-bound) overlapped
-        with policy logprob forward passes (GPU-bound).
         """
         import time as _time
-        from concurrent.futures import ThreadPoolExecutor
         _t_start = _time.perf_counter()
 
         data = dataset._data
@@ -1069,90 +1065,8 @@ class GRPOTrainer(_BaseTrainer):
             dataset._shared_keys.discard(key)
             dataset._sample_keys.discard(key)
 
-        # ---- 2. Launch reward function calls in BG thread (CPU-bound) ----
-        # Only the pure-Python reward function calls run in the thread.
-        # CUDA tensor ops stay on the main thread to avoid thread-safety issues.
-        def _call_reward_funcs_bg():
-            """Run reward functions and return results as plain Python lists."""
-            keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-            reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-            reward_kwargs["trainer_state"] = self.state
-            results = []
-            for reward_func, reward_processing_class, reward_func_name in zip(
-                self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True
-            ):
-                if isinstance(reward_func, nn.Module) or asyncio.iscoroutinefunction(reward_func):
-                    # Module/async rewards need main thread — return None as placeholder
-                    results.append(None)
-                else:
-                    output = reward_func(
-                        prompts=prompts, completions=completions,
-                        completion_ids=completion_ids_list, **reward_kwargs
-                    )
-                    results.append([r if r is not None else float('nan') for r in output])
-            return results
-
-        reward_executor = ThreadPoolExecutor(max_workers=1)
-        reward_future = reward_executor.submit(_call_reward_funcs_bg)
-
-        # ---- 3. Compute policy logprobs (GPU-bound) ----
-        prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
-        attention_mask = torch.cat([data["prompt_mask"], data["completion_mask"]], dim=1)
-        logits_to_keep = data["completion_ids"].size(1)
-
-        forward_kwargs = {}
-        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
-                     "image_sizes", "token_type_ids", "mm_token_type_ids"):
-            if key in data:
-                forward_kwargs[key] = data[key]
-        num_images = data.get("num_images")
-
-        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-            generate_every = self.args.steps_per_generation * self.num_iterations
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                data["old_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
-                    self.model, prompt_completion_ids, attention_mask,
-                    logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
-                )
-
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model, prompt_completion_ids, attention_mask,
-                        logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
-                    )
-                else:
-                    unwrapped = self.accelerator.unwrap_model(self.model)
-                    adapter_name = "ref" if "ref" in unwrapped.peft_config else None
-                    with use_adapter(unwrapped, adapter_name=adapter_name):
-                        data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
-                            self.model, prompt_completion_ids, attention_mask,
-                            logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
-                        )
-
-        _t_logprobs = _time.perf_counter()
-
-        # ---- 4. Wait for reward results and build tensor on main thread ----
-        bg_reward_results = reward_future.result()
-        reward_executor.shutdown(wait=False)
-
-        # Build rewards_per_func tensor from BG results (CUDA ops on main thread)
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        any_need_main_thread = False
-        for i, result in enumerate(bg_reward_results):
-            if result is not None:
-                rewards_per_func[:, i] = torch.tensor(result, dtype=torch.float32, device=device)
-            else:
-                any_need_main_thread = True
-
-        # Fall back to full _calculate_rewards if any funcs couldn't run in BG
-        if any_need_main_thread:
-            rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
-        else:
-            rewards_per_func = gather(rewards_per_func)
-
+        # ---- 2. Compute rewards and advantages ----
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         num_generations = self.num_generations
 
         if self.multi_objective_aggregation == "sum_then_normalize":
@@ -1206,7 +1120,7 @@ class GRPOTrainer(_BaseTrainer):
         # Replace placeholder advantages in the dataset
         data["advantages"] = advantages
 
-        # ---- 5. Accumulate reward metrics (main thread — safe) ----
+        # ---- 3. Accumulate reward metrics (main thread — safe) ----
         for i, reward_func_name in enumerate(self.reward_func_names):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
                 torch.nanmean(rewards_per_func[:, i]).item()
@@ -1221,7 +1135,48 @@ class GRPOTrainer(_BaseTrainer):
 
         _t_rewards = _time.perf_counter()
 
-        # ---- 6. Clean up sentinels & register new keys ----
+        # ---- 4. Compute policy logprobs ----
+        prompt_completion_ids = torch.cat([data["prompt_ids"], data["completion_ids"]], dim=1)
+        attention_mask = torch.cat([data["prompt_mask"], data["completion_mask"]], dim=1)
+        logits_to_keep = data["completion_ids"].size(1)
+
+        forward_kwargs = {}
+        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
+                     "image_sizes", "token_type_ids", "mm_token_type_ids"):
+            if key in data:
+                forward_kwargs[key] = data[key]
+        num_images = data.get("num_images")
+
+        # Use larger batch for inference-only logprob computation (no grad = less memory)
+        logprob_batch_size = min(batch_size * 4, len(prompt_completion_ids))
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                data["old_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                    self.model, prompt_completion_ids, attention_mask,
+                    logits_to_keep, logprob_batch_size, num_images=num_images, **forward_kwargs,
+                )
+
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model, prompt_completion_ids, attention_mask,
+                        logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
+                    )
+                else:
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    adapter_name = "ref" if "ref" in unwrapped.peft_config else None
+                    with use_adapter(unwrapped, adapter_name=adapter_name):
+                        data["ref_per_token_logps"], _ = self._get_per_token_logps_and_entropies(
+                            self.model, prompt_completion_ids, attention_mask,
+                            logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
+                        )
+
+        _t_logprobs = _time.perf_counter()
+
+        # ---- 5. Clean up sentinels & register new keys ----
         del data["_pending_policy_logps"]
         dataset._shared_keys.discard("_pending_policy_logps")
 
@@ -1230,16 +1185,19 @@ class GRPOTrainer(_BaseTrainer):
             if key in data:
                 dataset._sample_keys.add(key)
 
-        # ---- 7. Shuffle (deferred from produce()) ----
+        # ---- 6. Shuffle (deferred from produce()) ----
+        # The BG thread skipped the shuffle so we could compute advantages
+        # with grouped prompt ordering.  Now that scoring is done, shuffle
+        # the dataset to break prompt-group correlation between mini-batches.
         shuffled = shuffle_sequence_dict(data)
         dataset._data = shuffled
 
         _t_end = _time.perf_counter()
         logger.info(
             f"[TIMING] _compute_deferred_scores: "
-            f"policy_logprobs={_t_logprobs-_t_start:.3f}s, "
-            f"rewards+advantages={_t_rewards-_t_logprobs:.3f}s, "
-            f"cleanup+shuffle={_t_end-_t_rewards:.3f}s, "
+            f"rewards+advantages={_t_rewards-_t_start:.3f}s, "
+            f"policy_logprobs={_t_logprobs-_t_rewards:.3f}s, "
+            f"cleanup+shuffle={_t_end-_t_logprobs:.3f}s, "
             f"total={_t_end-_t_start:.3f}s"
         )
 
