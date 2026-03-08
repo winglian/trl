@@ -1053,26 +1053,21 @@ class GRPOTrainer(_BaseTrainer):
 
         data = dataset._data
         device = self.accelerator.device
-        # Use larger batch for inference logprobs (no gradients needed, so can fit more)
-        batch_size = min(data["completion_ids"].size(0), self.args.per_device_train_batch_size * 4)
+        batch_size = self.args.per_device_train_batch_size
         mode = "train"
 
-        # ---- 1. Recover deferred data ----
+        # ---- 1. Recover deferred inputs for reward computation ----
         inputs = data.pop("_deferred_inputs")
         prompts = data.pop("_deferred_prompts")
         completions = data.pop("_deferred_completions")
         completion_ids_list = data.pop("_deferred_completion_ids_list")
-        # Use pre-computed rewards from BG thread if available
-        rewards_per_func = data.pop("_deferred_rewards_per_func", None)
         for key in ("_deferred_inputs", "_deferred_prompts",
-                     "_deferred_completions", "_deferred_completion_ids_list",
-                     "_deferred_rewards_per_func"):
+                     "_deferred_completions", "_deferred_completion_ids_list"):
             dataset._shared_keys.discard(key)
             dataset._sample_keys.discard(key)
 
-        # ---- 2. Compute rewards (if not pre-computed) and advantages ----
-        if rewards_per_func is None:
-            rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        # ---- 2. Compute rewards and advantages ----
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         num_generations = self.num_generations
 
         if self.multi_objective_aggregation == "sum_then_normalize":
@@ -1153,8 +1148,7 @@ class GRPOTrainer(_BaseTrainer):
                 forward_kwargs[key] = data[key]
         num_images = data.get("num_images")
 
-        # Use torch.no_grad() for old/ref logprobs since they don't need gradients
-        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+        with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
@@ -2125,31 +2119,12 @@ class GRPOTrainer(_BaseTrainer):
                     elif not isinstance(values, list):
                         inp[key] = values
 
-        # ---- BG thread early return: skip policy logprobs -----------------------
-        # Compute rewards on the BG thread (they're CPU-bound and don't need
-        # the training model). Skip _calculate_rewards() wrapper to avoid
-        # thread-unsafe gather() and self.state access.
+        # ---- BG thread early return: skip ALL scoring --------------------------
+        # When skip_policy_logps=True the code runs on a background thread.
+        # Rather than trying to make reward computation / advantage normalisation
+        # / distributed collectives thread-safe, we return the generation output
+        # immediately and defer *all* scoring to the main thread.
         if skip_policy_logps:
-            # Compute rewards directly on the BG thread
-            rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-            keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-            reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-            for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
-                zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
-            ):
-                if not isinstance(reward_func, nn.Module) and not asyncio.iscoroutinefunction(reward_func):
-                    try:
-                        output_reward_func = reward_func(
-                            prompts=prompts, completions=completions,
-                            completion_ids=completion_ids_list, **reward_kwargs
-                        )
-                        output_reward_func = [r if r is not None else torch.nan for r in output_reward_func]
-                        rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-                    except Exception:
-                        pass  # Fall back to computing on main thread
-            # gather for single-process is identity; for multi-GPU this is deferred
-            rewards_per_func = gather(rewards_per_func)
-
             output = {
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
@@ -2159,9 +2134,7 @@ class GRPOTrainer(_BaseTrainer):
                 # Placeholder — replaced on the main thread by _compute_deferred_scores
                 "advantages": torch.zeros(completion_ids.size(0), device=device),
                 "_pending_policy_logps": True,
-                # Pre-computed rewards from BG thread
-                "_deferred_rewards_per_func": rewards_per_func,
-                # Raw data for deferred logging
+                # Raw data for deferred reward / advantage computation
                 "_deferred_inputs": inputs,
                 "_deferred_prompts": prompts,
                 "_deferred_completions": completions,
