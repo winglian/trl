@@ -1148,7 +1148,7 @@ class GRPOTrainer(_BaseTrainer):
                 forward_kwargs[key] = data[key]
         num_images = data.get("num_images")
 
-        with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
