@@ -178,27 +178,6 @@ class GRPOConfig(_BaseConfig):
         prefetch_depth (`int`, *optional*, defaults to `1`):
             Number of rollouts to produce ahead of training when ``async_prefetch`` is enabled. Higher values
             keep the GPU more saturated but increase off-policy staleness.
-        sync_warmup_rollouts (`int`, *optional*, defaults to `0`):
-            Number of initial rollouts to produce synchronously before switching to async prefetch. During warmup,
-            each rollout is generated on-policy so the model can bootstrap learning from sparse reward signals.
-        reroll_start_fraction (`float`, *optional*, defaults to `0.5`):
-            Fraction of total training steps after which deferred re-rolling begins. Prompts that produced zero
-            reward variance are buffered and re-injected into later batches when the model is more likely to solve
-            them. Set to ``1.0`` to disable.
-        reroll_max_groups (`int`, *optional*, defaults to `1`):
-            Maximum number of prompt groups to replace with re-roll candidates per batch. Higher values increase
-            data utilization but reduce prompt diversity.
-        reward_num_workers (`int`, *optional*, defaults to `1`):
-            Number of persistent subprocess workers for parallel reward computation. Each worker has its own
-            main thread so ``signal.alarm()`` (used by ``math_verify``) works correctly. Work is sharded across
-            workers by prompt groups.
-        replay_buffer_size (`int`, *optional*, defaults to `0`):
-            Size of the replay buffer for storing high-signal rollout groups. When > 0, groups with reward
-            variance are cached and used to replace zero-signal groups. Set to 0 to disable.
-        replay_recompute_logps (`bool`, *optional*, defaults to `True`):
-            When ``True``, recompute ``old_per_token_logps`` for replayed groups using the current training
-            model, fixing importance sampling mismatch from stale data. Only relevant when
-            ``replay_buffer_size > 0``.
         streaming_partial_batch (`bool`, *optional*, defaults to `False`):
             Enable verl-style streaming partial batch training. When ``True``, training begins on prompt
             groups as they are scored, rather than waiting for the full batch to be scored. This reduces
@@ -644,53 +623,6 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Number of rollouts to produce ahead of training when async_prefetch is enabled. Higher values "
             "keep the GPU more saturated but increase off-policy staleness."
-        },
-    )
-    sync_warmup_rollouts: int = field(
-        default=0,
-        metadata={
-            "help": "Number of initial rollouts to produce synchronously before switching to async prefetch. "
-            "During warmup, each rollout is generated on-policy so the model can bootstrap learning from sparse "
-            "reward signals."
-        },
-    )
-    reward_num_workers: int = field(
-        default=1,
-        metadata={
-            "help": "Number of persistent subprocess workers for parallel reward computation. Each worker has its "
-            "own main thread so signal.alarm() (used by math_verify) works correctly. Work is sharded across "
-            "workers by prompt groups. Only used with use_data_producer=True and non-nn.Module reward functions."
-        },
-    )
-    replay_buffer_size: int = field(
-        default=0,
-        metadata={
-            "help": "[Experimental, disabled by default] Size of the replay buffer for storing high-signal rollout "
-            "groups. When > 0, groups with reward variance are cached and used to replace zero-signal groups "
-            "(where all rewards are identical). Set to 0 to disable. Only used with use_data_producer=True."
-        },
-    )
-    replay_recompute_logps: bool = field(
-        default=True,
-        metadata={
-            "help": "When True (default), recompute old_per_token_logps for replayed groups using the current "
-            "training model. This fixes the importance sampling mismatch that occurs when replaying stale data. "
-            "Only relevant when replay_buffer_size > 0."
-        },
-    )
-    reroll_start_fraction: float = field(
-        default=0.5,
-        metadata={
-            "help": "Fraction of total training steps after which deferred re-rolling begins. Zero-signal prompts "
-            "(where all rewards in a group are identical) are buffered and re-injected into later batches when the "
-            "model is more likely to solve them. Set to 1.0 to disable. Only used with use_data_producer=True."
-        },
-    )
-    reroll_max_groups: int = field(
-        default=1,
-        metadata={
-            "help": "Maximum number of prompt groups to replace with re-roll candidates per batch. Higher values "
-            "increase data utilization but reduce prompt diversity. Only used with use_data_producer=True."
         },
     )
     streaming_partial_batch: bool = field(
