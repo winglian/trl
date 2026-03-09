@@ -147,7 +147,16 @@ class _StreamingDataLoader:
         self._min_groups = max(1, min_groups)
         n_samples = len(dataset)
         self._n_groups = n_samples // num_generations
-        self._n_micro_batches = n_samples // batch_size
+        # Compute actual micro-batch count matching __iter__: each chunk of
+        # min_groups*num_generations samples yields ceil(chunk_size/batch_size)
+        # micro-batches.  Sum across all chunks to get the true total.
+        chunk_size = self._min_groups * num_generations
+        n_full_chunks = self._n_groups // self._min_groups
+        remainder_groups = self._n_groups % self._min_groups
+        n_micro = n_full_chunks * -(-chunk_size // batch_size)  # ceil div
+        if remainder_groups > 0:
+            n_micro += -(-(remainder_groups * num_generations) // batch_size)
+        self._n_micro_batches = n_micro
 
     def __len__(self):
         return self._n_micro_batches
@@ -1419,11 +1428,19 @@ class GRPOTrainer(_BaseTrainer):
         attention_mask = torch.cat([chunk_prompt_mask, chunk_completion_mask], dim=1)
         logits_to_keep = chunk_completion_ids.size(1)
 
+        # Slice multimodal kwargs to match chunk range (s_start:s_end)
         forward_kwargs = {}
         for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
                      "image_sizes", "token_type_ids", "mm_token_type_ids"):
             if key in data:
-                forward_kwargs[key] = data[key]
+                val = data[key]
+                if isinstance(val, torch.Tensor) and val.dim() > 0 and val.size(0) == len(data["prompt_ids"]):
+                    forward_kwargs[key] = val[s_start:s_end]
+                else:
+                    forward_kwargs[key] = val
+        num_images = data.get("num_images")
+        if num_images is not None:
+            num_images = num_images[s_start:s_end] if hasattr(num_images, '__getitem__') else num_images
 
         logprob_batch_size = min(batch_size * 4, chunk_size)
         with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
@@ -1433,7 +1450,7 @@ class GRPOTrainer(_BaseTrainer):
             ):
                 old_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model, prompt_completion_ids, attention_mask,
-                    logits_to_keep, logprob_batch_size, **forward_kwargs,
+                    logits_to_keep, logprob_batch_size, num_images=num_images, **forward_kwargs,
                 )
                 if "old_per_token_logps" not in data:
                     # Initialize the full-batch tensor on first chunk
@@ -1447,7 +1464,7 @@ class GRPOTrainer(_BaseTrainer):
                 if self.ref_model is not None:
                     ref_logps, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model, prompt_completion_ids, attention_mask,
-                        logits_to_keep, batch_size, **forward_kwargs,
+                        logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                     )
                 else:
                     unwrapped = self.accelerator.unwrap_model(self.model)
@@ -1455,7 +1472,7 @@ class GRPOTrainer(_BaseTrainer):
                     with use_adapter(unwrapped, adapter_name=adapter_name):
                         ref_logps, _ = self._get_per_token_logps_and_entropies(
                             self.model, prompt_completion_ids, attention_mask,
-                            logits_to_keep, batch_size, **forward_kwargs,
+                            logits_to_keep, batch_size, num_images=num_images, **forward_kwargs,
                         )
                 if "ref_per_token_logps" not in data:
                     total_samples = len(data["prompt_ids"])
@@ -1932,16 +1949,8 @@ class GRPOTrainer(_BaseTrainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
-    def _generate_single_turn(self, prompts: list):
+    def _generate_single_turn(self, prompts: list, mode: str = "train"):
         device = self.accelerator.device
-        # When called from a background thread (async DataProducer), reading
-        # self.model.training is racy — the main thread toggles it.  BG threads
-        # always produce training data, so force mode="train".
-        import threading
-        if threading.current_thread() is not threading.main_thread():
-            mode = "train"
-        else:
-            mode = "train" if self.model.training else "eval"
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
@@ -2055,7 +2064,7 @@ class GRPOTrainer(_BaseTrainer):
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
-    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs):
+    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, mode="train"):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
@@ -2159,7 +2168,7 @@ class GRPOTrainer(_BaseTrainer):
 
             # Generate new completions after tool execution
             prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = self._generate_single_turn(
-                prompt_completion_tools
+                prompt_completion_tools, mode=mode
             )
 
             # Sanity check: from experience, this is useful to catch bugs in the chat template
@@ -2239,7 +2248,7 @@ class GRPOTrainer(_BaseTrainer):
         # Copy the prompts to avoid modifying the original list
         prompts = copy.deepcopy(prompts)
 
-        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
+        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts, mode=mode)
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
         if is_conversational({"prompt": prompts[0]}):
@@ -2265,7 +2274,7 @@ class GRPOTrainer(_BaseTrainer):
                 logprobs,
                 tool_call_count,
                 tool_failure_count,
-            ) = self._tool_call_loop(prompts, prompt_ids, completion_ids, completions, logprobs)
+            ) = self._tool_call_loop(prompts, prompt_ids, completion_ids, completions, logprobs, mode=mode)
         else:
             # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
             # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
@@ -2931,8 +2940,24 @@ class GRPOTrainer(_BaseTrainer):
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
-        if self.use_vllm and self.vllm_importance_sampling_correction and "importance_sampling_ratio" in inputs:
-            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            if "importance_sampling_ratio" in inputs:
+                per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
+            elif "old_per_token_logps" in inputs and "sampling_per_token_logps" in inputs:
+                # Async/streaming path: compute IS ratio on the fly from available logps
+                is_mask = mask if "tool_mask" not in inputs else mask * inputs["tool_mask"]
+                per_token_logps_diff = (inputs["old_per_token_logps"] - inputs["sampling_per_token_logps"]) * is_mask
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                else:
+                    logps_diff = per_token_logps_diff
+                is_ratio = torch.exp(logps_diff)
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    is_ratio = torch.clamp(is_ratio, max=self.vllm_importance_sampling_cap)
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    is_ratio = is_ratio.masked_fill(is_ratio > self.vllm_importance_sampling_cap, value=0.0)
+                per_token_loss = per_token_loss * is_ratio
 
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
