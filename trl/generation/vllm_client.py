@@ -520,17 +520,30 @@ class VLLMClient:
         Updates multiple named parameters in a single batch, reducing HTTP round-trips.
 
         Sends parameter metadata via HTTP POST, then broadcasts each tensor via NCCL in sequence.
-        When chunk_size is set, splits params into groups to avoid exceeding HTTP request size limits.
+        When chunk_size is set, splits params into chunks whose total element count doesn't exceed
+        the limit, avoiding large HTTP requests regardless of individual parameter sizes.
 
         Args:
             params: List of (name, weights_tensor) tuples.
-            chunk_size: Max params per HTTP call. None = all in one call. Use smaller values
-                        for large models to avoid HTTP request size limits.
+            chunk_size: Max total elements per HTTP call. None = all in one call. Use smaller
+                        values for large models to avoid HTTP request size limits.
         """
-        if chunk_size is None or chunk_size >= len(params):
+        if chunk_size is None:
             chunks = [params]
         else:
-            chunks = [params[i:i + chunk_size] for i in range(0, len(params), chunk_size)]
+            chunks = []
+            current_chunk = []
+            current_elements = 0
+            for name, weights in params:
+                n = weights.numel()
+                if current_chunk and current_elements + n > chunk_size:
+                    chunks.append(current_chunk)
+                    current_chunk = []
+                    current_elements = 0
+                current_chunk.append((name, weights))
+                current_elements += n
+            if current_chunk:
+                chunks.append(current_chunk)
 
         for chunk in chunks:
             # Send metadata for this chunk
@@ -564,7 +577,7 @@ class VLLMClient:
             model (`nn.Module`):
                 Model whose parameters (weights/biases) are to be updated.
             chunk_size (`int` or `None`, *optional*):
-                Max params per HTTP call. None = all in one call. Use smaller values
+                Max total elements per HTTP call. None = all in one call. Use smaller values
                 for large models to avoid HTTP request size limits.
         """
         params = [(name, param.data) for name, param in model.named_parameters()]

@@ -143,9 +143,10 @@ class GRPOConfig(_BaseConfig):
             Port number for the weight update group. This is used to communicate with the vLLM server. Unless the port
             is occupied, there is no need to change it.
         vllm_weight_sync_chunk_size (`int` or `None`, *optional*, defaults to `None`):
-            Maximum number of parameters per HTTP request during batched weight sync to the vLLM server. `None`
-            (default) sends all parameters in a single request. Set to a smaller value (e.g. 50) for large models to
-            avoid exceeding HTTP request size limits.
+            Maximum number of total tensor elements per HTTP request during batched weight sync to the vLLM
+            server. ``None`` (default) sends all parameters in a single request. Set to a smaller value (e.g.
+            ``100_000_000``) for large models to avoid exceeding HTTP request size limits. Unlike a per-parameter
+            count, this accounts for varying parameter sizes across models.
 
         > Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
 
@@ -590,9 +591,9 @@ class GRPOConfig(_BaseConfig):
     vllm_weight_sync_chunk_size: int | None = field(
         default=None,
         metadata={
-            "help": "Maximum number of parameters per HTTP request during batched weight sync to the vLLM server. "
-            "None (default) sends all parameters in a single request. Set to a smaller value (e.g. 50) for large "
-            "models to avoid exceeding HTTP request size limits."
+            "help": "Maximum total tensor elements per HTTP request during batched weight sync to the vLLM server. "
+            "None (default) sends all parameters in a single request. Set to a smaller value (e.g. 100_000_000) "
+            "for large models to avoid exceeding HTTP request size limits."
         },
     )
 
