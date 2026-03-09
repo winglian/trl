@@ -1541,6 +1541,91 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["reward_std"].append(agg_rewards.std().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
+        # ---- 6. Completion length & IS metrics (parity with sync path) ----
+        if is_last_chunk:
+            # Token count tracking
+            all_prompt_mask = data["prompt_mask"]
+            all_completion_mask = data["completion_mask"]
+            all_completion_ids = data["completion_ids"]
+            total_prompt_tokens = self.accelerator.gather(all_prompt_mask.sum())
+            total_completion_tokens = self.accelerator.gather(all_completion_mask.sum())
+            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
+            self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+
+            # Completion length metrics (use full batch, not just this chunk)
+            completion_lengths = all_completion_mask.sum(dim=1)
+            agg_completion_lengths = self.accelerator.gather(completion_lengths)
+            self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+
+            # Clipped ratio and terminated lengths
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor(
+                [ids[-1].item() not in eos_and_pad for ids in all_completion_ids], device=device
+            )
+            agg_is_truncated = self.accelerator.gather(is_truncated)
+            self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
+            term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
+            if len(term_completion_lengths) == 0:
+                term_completion_lengths = torch.zeros(1, device=device)
+            self._metrics[mode]["completions/mean_terminated_length"].append(
+                term_completion_lengths.float().mean().item()
+            )
+            self._metrics[mode]["completions/min_terminated_length"].append(
+                term_completion_lengths.float().min().item()
+            )
+            self._metrics[mode]["completions/max_terminated_length"].append(
+                term_completion_lengths.float().max().item()
+            )
+
+            # Importance sampling metrics
+            if (
+                self.use_vllm
+                and self.vllm_importance_sampling_correction
+                and "sampling_per_token_logps" in data
+                and "old_per_token_logps" in data
+            ):
+                old_logps = data["old_per_token_logps"]
+                sampling_logps = data["sampling_per_token_logps"]
+                mask = all_completion_mask.bool()
+                delta = torch.abs(old_logps - sampling_logps)
+                delta_masked = delta[mask]
+                mean_delta = torch.mean(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
+                max_delta = torch.max(delta_masked) if delta_masked.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                    self.accelerator.gather(mean_delta).mean().item()
+                )
+                self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                    self.accelerator.gather(max_delta).max().item()
+                )
+
+                # Compute IS ratio for metrics
+                is_mask = all_completion_mask if "tool_mask" not in data else all_completion_mask * data["tool_mask"]
+                per_token_logps_diff = (old_logps - sampling_logps) * is_mask
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                else:
+                    logps_diff = per_token_logps_diff
+                is_ratio = torch.exp(logps_diff)
+
+                if sequence_level_is:
+                    flat_is_ratio = is_ratio.flatten()
+                else:
+                    flat_is_ratio = is_ratio[mask]
+
+                if flat_is_ratio.numel() > 0:
+                    self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                        nanmin(self.accelerator.gather(torch.min(flat_is_ratio))).item()
+                    )
+                    self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                        self.accelerator.gather(torch.mean(flat_is_ratio)).nanmean().item()
+                    )
+                    self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                        nanmax(self.accelerator.gather(torch.max(flat_is_ratio))).item()
+                    )
+
         _t_end = _time.perf_counter()
         logger.info(
             f"[TIMING] streaming_group_scores [{s_start}:{s_end}]: "
