@@ -198,6 +198,16 @@ class GRPOConfig(_BaseConfig):
             When ``True``, recompute ``old_per_token_logps`` for replayed groups using the current training
             model, fixing importance sampling mismatch from stale data. Only relevant when
             ``replay_buffer_size > 0``.
+        streaming_partial_batch (`bool`, *optional*, defaults to `False`):
+            Enable verl-style streaming partial batch training. When ``True``, training begins on prompt
+            groups as they are scored, rather than waiting for the full batch to be scored. This reduces
+            peak GPU memory (only one group's logits in memory at a time) and allows reward subprocess
+            computation to overlap with subsequent groups' scoring. Requires ``use_data_producer=True``,
+            ``async_prefetch=True``, and ``scale_rewards="group"`` or ``"none"``.
+        streaming_min_groups (`int`, *optional*, defaults to `1`):
+            Minimum number of prompt groups to accumulate and score before yielding micro-batches for
+            training. Higher values give better inter-group shuffling at the cost of more latency.
+            Only relevant when ``streaming_partial_batch=True``.
 
         > Parameters that control the training
 
@@ -680,6 +690,22 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Maximum number of prompt groups to replace with re-roll candidates per batch. Higher values "
             "increase data utilization but reduce prompt diversity. Only used with use_data_producer=True."
+        },
+    )
+    streaming_partial_batch: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable verl-style streaming partial batch training. Scores and trains on prompt groups "
+            "incrementally instead of waiting for the full batch. Reduces peak GPU memory and enables "
+            "reward/scoring overlap. Requires use_data_producer=True, async_prefetch=True, and "
+            "scale_rewards='group' or 'none'."
+        },
+    )
+    streaming_min_groups: int = field(
+        default=1,
+        metadata={
+            "help": "Minimum number of prompt groups to accumulate before yielding micro-batches. "
+            "Higher values give better inter-group shuffling. Only used when streaming_partial_batch=True."
         },
     )
 

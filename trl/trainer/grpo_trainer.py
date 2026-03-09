@@ -127,6 +127,103 @@ class _SupportsReset(Protocol):
 EnvironmentFactory = Callable[[], _SupportsReset]
 
 
+class _StreamingDataLoader:
+    """A lazy dataloader that scores prompt groups incrementally.
+
+    Instead of scoring the entire batch upfront, this dataloader scores
+    ``min_groups`` prompt groups at a time, yielding micro-batches as they
+    are scored. This reduces peak GPU memory (only one group-chunk's logits
+    in memory) and allows reward subprocess computation to overlap with
+    subsequent groups' policy logprob computation.
+
+    Used when ``streaming_partial_batch=True`` in GRPOConfig.
+    """
+
+    def __init__(self, dataset, trainer, batch_size, num_generations, min_groups):
+        self._dataset = dataset
+        self._trainer = trainer
+        self._batch_size = batch_size
+        self._num_gen = num_generations
+        self._min_groups = max(1, min_groups)
+        n_samples = len(dataset)
+        self._n_groups = n_samples // num_generations
+        self._n_micro_batches = n_samples // batch_size
+
+    def __len__(self):
+        return self._n_micro_batches
+
+    def __iter__(self):
+        import time as _time
+        _t_start = _time.perf_counter()
+
+        data = self._dataset._data
+        device = self._trainer.accelerator.device
+        batch_size = self._batch_size
+        num_gen = self._num_gen
+        mode = "train"
+
+        # Extract deferred scoring data (same as _compute_deferred_scores)
+        inputs = data.pop("_deferred_inputs")
+        prompts = data.pop("_deferred_prompts")
+        completions = data.pop("_deferred_completions")
+        completion_ids_list = data.pop("_deferred_completion_ids_list")
+        for key in ("_deferred_inputs", "_deferred_prompts",
+                     "_deferred_completions", "_deferred_completion_ids_list"):
+            self._dataset._shared_keys.discard(key)
+            self._dataset._sample_keys.discard(key)
+
+        # Clean up sentinels
+        del data["_pending_policy_logps"]
+        del data["_streaming_pending"]
+        self._dataset._shared_keys.discard("_pending_policy_logps")
+        self._dataset._shared_keys.discard("_streaming_pending")
+
+        # Shared keys (non-sample data like num_items_in_batch)
+        shared_keys = set(self._dataset._shared_keys)
+
+        # Process groups in chunks of min_groups
+        for chunk_start_g in range(0, self._n_groups, self._min_groups):
+            chunk_end_g = min(chunk_start_g + self._min_groups, self._n_groups)
+            s_start = chunk_start_g * num_gen
+            s_end = chunk_end_g * num_gen
+
+            # Score this chunk of groups
+            self._trainer._compute_streaming_group_scores(
+                data=data,
+                s_start=s_start,
+                s_end=s_end,
+                inputs=inputs[s_start:s_end],
+                prompts=prompts[s_start:s_end],
+                completions=completions[s_start:s_end],
+                completion_ids_list=completion_ids_list[s_start:s_end],
+                is_last_chunk=(chunk_end_g == self._n_groups),
+            )
+
+            # Shuffle within the scored chunk, then yield micro-batches
+            chunk_size = s_end - s_start
+            perm = torch.randperm(chunk_size)
+            for mb_offset in range(0, chunk_size, batch_size):
+                mb_indices = perm[mb_offset:mb_offset + batch_size]
+                abs_indices = mb_indices + s_start
+                micro_batch = {}
+                for key in data:
+                    if key.startswith("_"):
+                        continue
+                    val = data[key]
+                    if key in shared_keys:
+                        micro_batch[key] = val
+                    elif isinstance(val, torch.Tensor) and val.dim() > 0:
+                        micro_batch[key] = val[abs_indices]
+                    else:
+                        micro_batch[key] = val
+                yield micro_batch
+
+        _t_end = _time.perf_counter()
+        logger.info(
+            f"[TIMING] StreamingDataLoader: total scoring+yield time={_t_end-_t_start:.3f}s"
+        )
+
+
 class GRPOTrainer(_BaseTrainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -1101,8 +1198,16 @@ class GRPOTrainer(_BaseTrainer):
         _t3 = _time.perf_counter()
 
         if isinstance(dataset, RolloutDataset) and dataset._data.get("_pending_policy_logps"):
-            self._compute_deferred_scores(dataset)
-        _t4 = _time.perf_counter()
+            if self.args.streaming_partial_batch:
+                # Streaming mode: defer scoring to the dataloader, which will score groups
+                # incrementally as micro-batches are consumed.
+                dataset._data["_streaming_pending"] = True
+                _t4 = _time.perf_counter()
+            else:
+                self._compute_deferred_scores(dataset)
+                _t4 = _time.perf_counter()
+        else:
+            _t4 = _time.perf_counter()
 
         logger.info(
             f"[TIMING] _produce_data: weight_sync={_t1-_t0:.3f}s, "
@@ -1121,6 +1226,15 @@ class GRPOTrainer(_BaseTrainer):
         """
         if not isinstance(dataset, RolloutDataset):
             return super()._get_online_dataloader(dataset)
+
+        if self.args.streaming_partial_batch and dataset._data.get("_streaming_pending"):
+            return _StreamingDataLoader(
+                dataset=dataset,
+                trainer=self,
+                batch_size=self.args.per_device_train_batch_size,
+                num_generations=self.num_generations,
+                min_groups=self.args.streaming_min_groups,
+            )
 
         return DataLoader(
             dataset,
@@ -1450,6 +1564,251 @@ class GRPOTrainer(_BaseTrainer):
             f"rewards+advantages={_t_rewards-_t_logprobs:.3f}s, "
             f"cleanup+shuffle={_t_end-_t_rewards:.3f}s, "
             f"total={_t_end-_t_start:.3f}s"
+        )
+
+    # -- Streaming group scoring -----------------------------------------------
+
+    @torch.no_grad()
+    def _compute_streaming_group_scores(
+        self, data, s_start, s_end, inputs, prompts, completions, completion_ids_list, is_last_chunk
+    ):
+        """Score a chunk of prompt groups: rewards, policy logprobs, advantages.
+
+        Called by ``_StreamingDataLoader`` to incrementally score groups. Writes
+        results directly into the ``data`` dict at positions ``s_start:s_end``.
+
+        Args:
+            data: The dataset._data dict (mutable).
+            s_start, s_end: Sample index range for this chunk.
+            inputs: Deferred inputs for this chunk's samples.
+            prompts, completions, completion_ids_list: Deferred reward inputs.
+            is_last_chunk: Whether this is the last chunk (for metrics/buffer logging).
+        """
+        import time as _time
+        _t0 = _time.perf_counter()
+
+        device = self.accelerator.device
+        batch_size = self.args.per_device_train_batch_size
+        num_generations = self.num_generations
+        mode = "train"
+        chunk_size = s_end - s_start
+
+        # ---- 1. Launch reward computation in subprocess ----
+        _reward_can_bg = all(
+            not isinstance(rf, nn.Module) and not asyncio.iscoroutinefunction(rf)
+            for rf in self.reward_funcs
+        )
+        _reward_sent = False
+        _reward_workers_used = []
+        if _reward_can_bg:
+            workers = self._get_reward_workers()
+            num_workers = len(workers)
+            num_groups = chunk_size // num_generations
+            groups_per_worker = max(1, (num_groups + num_workers - 1) // num_workers)
+            for w_idx, (conn, proc) in enumerate(workers):
+                g_start = w_idx * groups_per_worker
+                g_end = min((w_idx + 1) * groups_per_worker, num_groups)
+                if g_start >= num_groups:
+                    break
+                ws = g_start * num_generations
+                we = g_end * num_generations
+                conn.send((
+                    self.reward_funcs,
+                    prompts[ws:we],
+                    completions[ws:we],
+                    completion_ids_list[ws:we],
+                    inputs[ws:we],
+                    self.reward_func_names,
+                ))
+                _reward_workers_used.append(conn)
+            _reward_sent = True
+
+        # ---- 2. Compute policy logprobs for this chunk ----
+        chunk_prompt_ids = data["prompt_ids"][s_start:s_end]
+        chunk_completion_ids = data["completion_ids"][s_start:s_end]
+        chunk_prompt_mask = data["prompt_mask"][s_start:s_end]
+        chunk_completion_mask = data["completion_mask"][s_start:s_end]
+        prompt_completion_ids = torch.cat([chunk_prompt_ids, chunk_completion_ids], dim=1)
+        attention_mask = torch.cat([chunk_prompt_mask, chunk_completion_mask], dim=1)
+        logits_to_keep = chunk_completion_ids.size(1)
+
+        forward_kwargs = {}
+        for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
+                     "image_sizes", "token_type_ids", "mm_token_type_ids"):
+            if key in data:
+                forward_kwargs[key] = data[key]
+
+        logprob_batch_size = min(batch_size * 4, chunk_size)
+        with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                old_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model, prompt_completion_ids, attention_mask,
+                    logits_to_keep, logprob_batch_size, **forward_kwargs,
+                )
+                if "old_per_token_logps" not in data:
+                    # Initialize the full-batch tensor on first chunk
+                    total_samples = len(data["prompt_ids"])
+                    data["old_per_token_logps"] = torch.zeros(
+                        total_samples, old_logps.size(1), device=device, dtype=old_logps.dtype
+                    )
+                data["old_per_token_logps"][s_start:s_end] = old_logps
+
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model, prompt_completion_ids, attention_mask,
+                        logits_to_keep, batch_size, **forward_kwargs,
+                    )
+                else:
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    adapter_name = "ref" if "ref" in unwrapped.peft_config else None
+                    with use_adapter(unwrapped, adapter_name=adapter_name):
+                        ref_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model, prompt_completion_ids, attention_mask,
+                            logits_to_keep, batch_size, **forward_kwargs,
+                        )
+                if "ref_per_token_logps" not in data:
+                    total_samples = len(data["prompt_ids"])
+                    data["ref_per_token_logps"] = torch.zeros(
+                        total_samples, ref_logps.size(1), device=device, dtype=ref_logps.dtype
+                    )
+                data["ref_per_token_logps"][s_start:s_end] = ref_logps
+
+        _t_logprobs = _time.perf_counter()
+
+        # ---- 3. Wait for rewards ----
+        if _reward_sent and _reward_workers_used:
+            all_worker_results = []
+            any_failed = False
+            for conn in _reward_workers_used:
+                result = conn.recv()
+                if result is None:
+                    any_failed = True
+                    break
+                all_worker_results.append(result)
+
+            if not any_failed:
+                rewards_per_func = torch.zeros(chunk_size, len(self.reward_funcs), device=device)
+                offset = 0
+                for worker_result in all_worker_results:
+                    cs = len(worker_result[0])
+                    for i, result in enumerate(worker_result):
+                        rewards_per_func[offset:offset + cs, i] = torch.tensor(
+                            result, dtype=torch.float32, device=device
+                        )
+                    offset += cs
+                rewards_per_func = gather(rewards_per_func)
+            else:
+                rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        else:
+            rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+
+        # ---- 4. Compute advantages (group-level normalization) ----
+        # Streaming requires group-level normalization (scale_rewards="group" or "none")
+        num_groups = chunk_size // num_generations
+        if self.multi_objective_aggregation == "sum_then_normalize":
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            if num_generations > 1:
+                std_rewards = rewards.view(-1, num_generations).std(dim=1)
+                std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+            else:
+                std_rewards = torch.zeros_like(rewards)
+            advantages = rewards - mean_grouped_rewards
+            if self.scale_rewards != "none":
+                advantages = advantages / (std_rewards + 1e-4)
+            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+
+        elif self.multi_objective_aggregation == "normalize_then_sum":
+            grouped = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
+            mean_k = torch.nanmean(grouped, dim=1, keepdim=True)
+            std_k = nanstd(grouped, dim=1, keepdim=True) if num_generations > 1 else torch.zeros_like(mean_k)
+            reward_k = (grouped - mean_k) / (std_k + 1e-4)
+            reward_k = reward_k.view(-1, len(self.reward_funcs))
+            rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            std_rewards = rewards.view(-1, num_generations).std(dim=1).repeat_interleave(num_generations, dim=0)
+            mean_rewards = rewards.view(-1, num_generations).mean(dim=1).repeat_interleave(num_generations, dim=0)
+            advantages = (rewards - mean_rewards) / (std_rewards + 1e-4)
+            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+        else:
+            raise ValueError(f"Invalid multi_objective_aggregation: {self.multi_objective_aggregation}")
+
+        # Slice for local process
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # Write advantages into dataset
+        if "advantages" not in data or not isinstance(data["advantages"], torch.Tensor):
+            total_samples = len(data["prompt_ids"])
+            data["advantages"] = torch.zeros(total_samples, device=device)
+        data["advantages"][s_start:s_end] = advantages
+
+        # ---- 5. Replay buffer: store high-signal groups ----
+        if self._replay_buffer is not None:
+            local_rewards = rewards_per_func[process_slice]
+            local_grouped = local_rewards.view(-1, num_generations, len(self.reward_funcs))
+            per_group_std = local_grouped.std(dim=1)
+            has_signal = (per_group_std > 0).any(dim=1)
+
+            if has_signal.any():
+                grouped_adv = advantages.view(-1, num_generations)
+                replay_scores = (grouped_adv.abs().sum(dim=1) * per_group_std.sum(dim=1))
+                for group_idx in has_signal.nonzero(as_tuple=True)[0]:
+                    gi = group_idx.item()
+                    start = s_start + gi * num_generations
+                    end = start + num_generations
+                    group_data = {}
+                    for key in data:
+                        val = data[key]
+                        if isinstance(val, torch.Tensor) and val.dim() > 0 and val.size(0) >= end:
+                            group_data[key] = val[start:end].clone()
+                    self._replay_buffer.add(replay_scores[gi].item(), group_data)
+
+        # ---- 6. Buffer zero-signal prompts for re-rolling ----
+        if self.args.reroll_start_fraction < 1.0:
+            grouped_rewards = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
+            per_group_std = grouped_rewards.std(dim=1)
+            zero_signal = (per_group_std == 0).all(dim=1)
+            _n_buffered = 0
+            with self._reroll_lock:
+                for group_idx in zero_signal.nonzero(as_tuple=True)[0]:
+                    prompt_input = inputs[group_idx.item() * num_generations]
+                    self._reroll_buffer.append(prompt_input)
+                    _n_buffered += 1
+            if _n_buffered > 0:
+                self._metrics[mode]["reroll_buffered"].append(float(_n_buffered))
+
+        # ---- 7. Reward metrics ----
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+                torch.nanmean(rewards_per_func[:, i]).item()
+            )
+            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(
+                nanstd(rewards_per_func[:, i]).item()
+            )
+        agg_rewards = rewards_per_func.nansum(dim=1)
+        self._metrics[mode]["reward"].append(agg_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(agg_rewards.std().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        if is_last_chunk:
+            if self._replay_buffer is not None:
+                self._metrics[mode]["replay_buffer_size"].append(float(len(self._replay_buffer)))
+            if self.args.reroll_start_fraction < 1.0:
+                self._metrics[mode]["reroll_buffer_size"].append(float(len(self._reroll_buffer)))
+
+        _t_end = _time.perf_counter()
+        logger.info(
+            f"[TIMING] streaming_group_scores [{s_start}:{s_end}]: "
+            f"logprobs={_t_logprobs-_t0:.3f}s, rewards+adv={_t_end-_t_logprobs:.3f}s, "
+            f"total={_t_end-_t0:.3f}s"
         )
 
     # -- End DataProducer overrides -------------------------------------------
