@@ -1511,16 +1511,21 @@ class GRPOTrainer(_BaseTrainer):
                 self._metrics[mode]["replay_buffer_replacements"].append(float(n_replaced))
             self._metrics[mode]["replay_buffer_size"].append(float(len(self._replay_buffer)))
 
-        # ---- 4c. Buffer zero-signal prompts for deferred re-rolling ----
-        # When all rewards in a prompt group are identical (std=0), buffer the prompt
-        # so produce() can re-inject it later when the model is more likely to solve it.
+        # ---- 4c. Buffer unsolved prompts for deferred re-rolling ----
+        # When all rewards in a prompt group are identical (std=0), the group has no
+        # learning signal. Only buffer prompts the model FAILED on (all rewards ≈ 0)
+        # for re-rolling later. Prompts where all rewards are high (e.g., all 1.0)
+        # are already too easy and should be discarded, not re-rolled.
         if self.args.reroll_start_fraction < 1.0:
             grouped_rewards = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
             per_group_std = grouped_rewards.std(dim=1)  # (num_groups, num_reward_funcs)
+            per_group_mean = grouped_rewards.mean(dim=1)  # (num_groups, num_reward_funcs)
             zero_signal = (per_group_std == 0).all(dim=1)  # (num_groups,)
+            all_failed = (per_group_mean.abs() < 1e-6).all(dim=1)  # (num_groups,)
+            should_reroll = zero_signal & all_failed  # only buffer failed prompts
             _n_buffered = 0
             with self._reroll_lock:
-                for group_idx in zero_signal.nonzero(as_tuple=True)[0]:
+                for group_idx in should_reroll.nonzero(as_tuple=True)[0]:
                     prompt_input = inputs[group_idx.item() * num_generations]
                     self._reroll_buffer.append(prompt_input)
                     _n_buffered += 1
@@ -1771,14 +1776,19 @@ class GRPOTrainer(_BaseTrainer):
                             group_data[key] = val[start:end].clone()
                     self._replay_buffer.add(replay_scores[gi].item(), group_data)
 
-        # ---- 6. Buffer zero-signal prompts for re-rolling ----
+        # ---- 6. Buffer unsolved prompts for re-rolling ----
+        # Only re-roll prompts the model failed on (all rewards ≈ 0), not easy ones
+        # (all rewards high) which have no learning signal but shouldn't be retried.
         if self.args.reroll_start_fraction < 1.0:
             grouped_rewards = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
             per_group_std = grouped_rewards.std(dim=1)
+            per_group_mean = grouped_rewards.mean(dim=1)
             zero_signal = (per_group_std == 0).all(dim=1)
+            all_failed = (per_group_mean.abs() < 1e-6).all(dim=1)
+            should_reroll = zero_signal & all_failed
             _n_buffered = 0
             with self._reroll_lock:
-                for group_idx in zero_signal.nonzero(as_tuple=True)[0]:
+                for group_idx in should_reroll.nonzero(as_tuple=True)[0]:
                     prompt_input = inputs[group_idx.item() * num_generations]
                     self._reroll_buffer.append(prompt_input)
                     _n_buffered += 1
