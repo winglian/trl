@@ -155,6 +155,10 @@ class VLLMGeneration:
         group_port (`int`, *optional*, defaults to `51216`):
             Port number for the weight update group. This is used to communicate with the vLLM server. Unless the port
             is occupied, there is no need to change it.
+        weight_sync_chunk_size (`int` or `None`, *optional*, defaults to `None`):
+            Maximum number of parameters per HTTP request during batched weight sync to the vLLM server. `None`
+            (default) sends all parameters in a single request. Set to a smaller value (e.g. 50) for large models to
+            avoid exceeding HTTP request size limits.
 
         > Parameters for "colocate" vLLM mode:
 
@@ -245,6 +249,7 @@ class VLLMGeneration:
         server_port: int = 8000,
         server_timeout: float = 240.0,
         group_port: int = 51216,
+        weight_sync_chunk_size: int | None = None,
         # Colocate mode configuration
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
@@ -281,6 +286,7 @@ class VLLMGeneration:
         self.server_host = server_host
         self.server_port = server_port
         self.group_port = group_port
+        self.weight_sync_chunk_size = weight_sync_chunk_size
         self.server_timeout = server_timeout
 
         # Colocate mode configuration
@@ -530,7 +536,8 @@ class VLLMGeneration:
                     self._sync_fsdp1_params_to_vllm(model)  # use memory-efficient post-order traversal for FSDP
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(model)
-            else:
+            elif zero_stage_3:
+                # ZeRO-3 needs per-param gathering, can't easily batch
                 for name, param in model.named_parameters():
                     name = self._fix_param_name_to_vllm(name)
                     with gather_if_zero3([param]):
@@ -539,6 +546,16 @@ class VLLMGeneration:
                         elif self.mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                             llm_model.load_weights([(name, param.data)])
+            else:
+                if self.mode == "server" and accelerator.is_main_process:
+                    params = [(self._fix_param_name_to_vllm(name), param.data)
+                              for name, param in model.named_parameters()]
+                    self.vllm_client.batch_update_named_params(params, chunk_size=self.weight_sync_chunk_size)
+                elif self.mode == "colocate":
+                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                    weights = [(self._fix_param_name_to_vllm(name), param.data)
+                               for name, param in model.named_parameters()]
+                    llm_model.load_weights(weights=weights)
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:

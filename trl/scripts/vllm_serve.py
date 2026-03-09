@@ -185,6 +185,40 @@ class WeightSyncWorkerExtension:
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
+    def batch_update_named_params(self, params: list[tuple[str, str, tuple[int, ...]]]) -> None:
+        """
+        Receives and updates multiple named parameters in a single batch.
+
+        This avoids per-parameter HTTP round-trips. The client broadcasts each
+        parameter's tensor via NCCL in the same order as the params list.
+
+        Args:
+            params: List of (name, dtype, shape) tuples for each parameter.
+        """
+        if self.communicator is None:
+            raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
+
+        weights_to_load = []
+        for name, dtype_str, shape in params:
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            weight = torch.empty(shape, dtype=dtype, device=self.device)
+
+            if is_torch_xpu_available():
+                self.communicator.broadcast(weight, root=self.client_rank)
+            else:
+                self.communicator.broadcast(weight, src=self.client_rank)
+
+            weights_to_load.append((name, weight))
+
+        # Single barrier after all broadcasts
+        if is_torch_xpu_available():
+            self.communicator.barrier()
+        else:
+            self.communicator.group.barrier()
+
+        # Load all weights at once
+        self.model_runner.model.load_weights(weights=weights_to_load)
+
     def close_communicator(self) -> None:
         """
         Closes the communicator when weight synchronization is no longer needed.
@@ -846,12 +880,15 @@ def main(script_args: ScriptArguments):
         # The function init_communicator is called this way: init_communicator(host, port, world_size)
         # So with collective_rpc we need to call it this way:
         # llm.collective_rpc(method="init_communicator", args=(host, port, world_size))
+        import asyncio
+
         kwargs = {
             "method": "init_communicator",
             "args": (request.host, request.port, world_size, request.client_device_uuid),
         }
-        for connection in connections:
-            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        msg = {"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs}
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(None, conn.send, msg) for conn in connections))
 
         return {"message": "Request received, initializing communicator"}
 
@@ -874,14 +911,33 @@ def main(script_args: ScriptArguments):
                 - `shape` (list of `int`): Shape of the weight
 
         """
+        import asyncio
+
         # The function update_named_param is called this way: update_named_param("name", "torch.float32", (10, 10))
         # So with collective_rpc we need to call it this way:
         # llm.collective_rpc("update_named_param", args=("name", "torch.float32", (10, 10)))
         kwargs = {"method": "update_named_param", "args": (request.name, request.dtype, tuple(request.shape))}
-        for connection in connections:
-            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        msg = {"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs}
+        # Use run_in_executor to avoid blocking the event loop on pipe sends
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(None, conn.send, msg) for conn in connections))
 
         return {"message": "Request received, updating named parameter"}
+
+    class BatchUpdateWeightsRequest(BaseModel):
+        params: list[dict]  # List of {"name": str, "dtype": str, "shape": list[int]}
+
+    @app.post("/batch_update_named_params/")
+    async def batch_update_named_params(request: BatchUpdateWeightsRequest):
+        """Batch update: sends all param metadata in one HTTP call, then NCCL broadcasts happen in sequence."""
+        import asyncio
+
+        params_list = [(p["name"], p["dtype"], tuple(p["shape"])) for p in request.params]
+        kwargs = {"method": "batch_update_named_params", "args": (params_list,)}
+        msg = {"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs}
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(None, conn.send, msg) for conn in connections))
+        return {"message": f"Batch update started for {len(params_list)} parameters"}
 
     @app.post("/reset_prefix_cache/")
     async def reset_prefix_cache():

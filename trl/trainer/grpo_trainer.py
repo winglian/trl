@@ -549,7 +549,7 @@ class GRPOTrainer(_BaseTrainer):
             )
         if self.use_liger_kernel and not self.importance_sampling_level == "token":
             raise NotImplementedError(
-                "Liger Kernels currently only support token-level importance sampling. Please set"
+                "Liger Kernels currently only support token-level importance sampling. Please set "
                 "`importance_sampling_level` to 'token'."
             )
 
@@ -582,6 +582,24 @@ class GRPOTrainer(_BaseTrainer):
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
+
+        # Replay buffer: when enabled (replay_buffer_size > 0), stores high-signal rollout groups
+        # and replays them in place of zero-signal groups. With replay_recompute_logps=True (default),
+        # old_per_token_logps are recomputed from the current model to fix IS mismatch.
+        if args.replay_buffer_size > 0:
+            from trl.trainer.replay_buffer import ReplayBuffer
+            self._replay_buffer = ReplayBuffer(max_size=args.replay_buffer_size)
+        else:
+            self._replay_buffer = None
+        self._replay_recompute_logps = args.replay_recompute_logps
+
+        # Deferred re-roll buffer: prompts that produced zero reward variance are buffered here
+        # and re-injected into later batches (via produce()) when the model is stronger.
+        # _compute_deferred_scores (main thread) appends; produce() (BG thread) reads.
+        import threading as _threading
+        self._reroll_buffer = []
+        self._reroll_lock = _threading.Lock()
+
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
@@ -723,6 +741,7 @@ class GRPOTrainer(_BaseTrainer):
                 use_ref_model=self.beta != 0.0,
                 loss_type=self.loss_type,
                 max_completion_length=self.max_completion_length,
+                importance_sampling_level=self.importance_sampling_level,
             )
 
         # Initialize the metrics
@@ -768,6 +787,7 @@ class GRPOTrainer(_BaseTrainer):
                 server_host=args.vllm_server_host,
                 server_port=args.vllm_server_port,
                 group_port=args.vllm_group_port,
+                weight_sync_chunk_size=args.vllm_weight_sync_chunk_size,
                 server_timeout=args.vllm_server_timeout,
                 # Colocate mode configuration
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -794,6 +814,7 @@ class GRPOTrainer(_BaseTrainer):
                 rollout_func=rollout_func,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+
         else:
             generation_kwargs = {
                 "max_new_tokens": self.max_completion_length,
@@ -975,75 +996,80 @@ class GRPOTrainer(_BaseTrainer):
             seed=self.args.seed,
         )
 
-    # -- Persistent reward subprocess ------------------------------------------
+    # -- Persistent reward subprocess pool ------------------------------------
 
-    def _get_reward_worker(self):
-        """Return a persistent reward worker subprocess (lazy-initialized).
+    @staticmethod
+    def _persistent_reward_worker(conn):
+        """Long-lived reward worker. Receives work items, returns results."""
+        while True:
+            try:
+                msg = conn.recv()
+            except EOFError:
+                break
+            if msg is None:  # Shutdown signal
+                break
+            reward_funcs, prompts, completions, completion_ids_list, inputs, reward_func_names = msg
+            try:
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                results = []
+                for reward_func, reward_func_name in zip(reward_funcs, reward_func_names, strict=True):
+                    output = reward_func(
+                        prompts=prompts, completions=completions,
+                        completion_ids=completion_ids_list, **reward_kwargs
+                    )
+                    results.append([float(r) if r is not None else float('nan') for r in output])
+                conn.send(results)
+            except Exception:
+                conn.send(None)
 
-        Instead of spawning a new multiprocessing.Process per step (~0.1s overhead),
-        we keep a long-lived worker that receives (reward_funcs, args) over a pipe
-        and sends back results.  The worker has its own main thread so
-        ``signal.alarm()`` (used by ``math_verify``) works correctly.
+    def _get_reward_workers(self):
+        """Return a list of persistent reward worker subprocesses (lazy-initialized).
+
+        When ``reward_num_workers > 1``, work is sharded across workers by prompt
+        groups for parallel reward computation.  Each worker has its own main thread
+        so ``signal.alarm()`` (used by ``math_verify``) works correctly.
         """
-        if hasattr(self, "_reward_worker_conn") and self._reward_worker_conn is not None:
-            # Already running – check if alive
-            if self._reward_worker_proc.is_alive():
-                return self._reward_worker_conn
-            else:
-                # Worker died, clean up and respawn
-                self._reward_worker_conn.close()
-                self._reward_worker_conn = None
+        num_workers = getattr(self.args, "reward_num_workers", 1)
+        if num_workers < 1:
+            num_workers = 1
+
+        if hasattr(self, "_reward_workers") and self._reward_workers is not None:
+            # Check all alive, respawn dead ones
+            alive = all(proc.is_alive() for conn, proc in self._reward_workers)
+            if alive and len(self._reward_workers) == num_workers:
+                return self._reward_workers
+            # Some died or count changed — shut down and respawn all
+            self._shutdown_reward_workers()
 
         import multiprocessing as _mp
 
-        parent_conn, child_conn = _mp.Pipe()
+        workers = []
+        for _ in range(num_workers):
+            parent_conn, child_conn = _mp.Pipe()
+            proc = _mp.Process(target=self._persistent_reward_worker, args=(child_conn,), daemon=True)
+            proc.start()
+            child_conn.close()
+            workers.append((parent_conn, proc))
 
-        def _persistent_reward_worker(conn):
-            """Long-lived reward worker. Receives work items, returns results."""
-            import signal
-            while True:
-                try:
-                    msg = conn.recv()
-                except EOFError:
-                    break
-                if msg is None:  # Shutdown signal
-                    break
-                reward_funcs, prompts, completions, completion_ids_list, inputs, reward_func_names = msg
-                try:
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                    results = []
-                    for reward_func, reward_func_name in zip(reward_funcs, reward_func_names, strict=True):
-                        output = reward_func(
-                            prompts=prompts, completions=completions,
-                            completion_ids=completion_ids_list, **reward_kwargs
-                        )
-                        results.append([float(r) if r is not None else float('nan') for r in output])
-                    conn.send(results)
-                except Exception:
-                    conn.send(None)
+        self._reward_workers = workers
+        return workers
 
-        proc = _mp.Process(target=_persistent_reward_worker, args=(child_conn,), daemon=True)
-        proc.start()
-        child_conn.close()  # Parent doesn't need child end
-
-        self._reward_worker_conn = parent_conn
-        self._reward_worker_proc = proc
-        return parent_conn
-
-    def _shutdown_reward_worker(self):
-        """Shut down the persistent reward worker."""
-        if hasattr(self, "_reward_worker_conn") and self._reward_worker_conn is not None:
+    def _shutdown_reward_workers(self):
+        """Shut down all persistent reward workers."""
+        if not hasattr(self, "_reward_workers") or self._reward_workers is None:
+            return
+        for conn, proc in self._reward_workers:
             try:
-                self._reward_worker_conn.send(None)  # Shutdown signal
-                self._reward_worker_proc.join(timeout=5)
+                conn.send(None)  # Shutdown signal
+                proc.join(timeout=5)
             except Exception:
                 pass
             try:
-                self._reward_worker_conn.close()
+                conn.close()
             except Exception:
                 pass
-            self._reward_worker_conn = None
+        self._reward_workers = None
 
     # -- DataProducer overrides -----------------------------------------------
 
@@ -1131,22 +1157,41 @@ class GRPOTrainer(_BaseTrainer):
             dataset._shared_keys.discard(key)
             dataset._sample_keys.discard(key)
 
-        # ---- 2. Launch reward computation in persistent subprocess ----
+        # ---- 2. Launch reward computation in persistent subprocess pool ----
         # Reward functions like math_verify use signal.alarm() which only works
-        # in the main thread. Using a subprocess gives it its own main thread.
-        # A persistent worker avoids per-step process spawn/join overhead (~0.1s).
+        # in the main thread. Using subprocesses gives each its own main thread.
+        # Work is sharded across workers by prompt groups for parallelism.
         _reward_can_bg = all(
             not isinstance(rf, nn.Module) and not asyncio.iscoroutinefunction(rf)
             for rf in self.reward_funcs
         )
         _reward_sent = False
-        _reward_conn = None
+        _reward_workers_used = []
         if _reward_can_bg:
-            _reward_conn = self._get_reward_worker()
-            _reward_conn.send((
-                self.reward_funcs, prompts, completions,
-                completion_ids_list, inputs, self.reward_func_names,
-            ))
+            workers = self._get_reward_workers()
+            num_workers = len(workers)
+            num_generations = self.num_generations
+            num_prompts = len(prompts)
+            num_groups = num_prompts // num_generations
+
+            # Shard by prompt groups across workers
+            groups_per_worker = max(1, (num_groups + num_workers - 1) // num_workers)
+            for w_idx, (conn, proc) in enumerate(workers):
+                g_start = w_idx * groups_per_worker
+                g_end = min((w_idx + 1) * groups_per_worker, num_groups)
+                if g_start >= num_groups:
+                    break
+                s_start = g_start * num_generations
+                s_end = g_end * num_generations
+                conn.send((
+                    self.reward_funcs,
+                    prompts[s_start:s_end],
+                    completions[s_start:s_end],
+                    completion_ids_list[s_start:s_end],
+                    inputs[s_start:s_end],
+                    self.reward_func_names,
+                ))
+                _reward_workers_used.append(conn)
             _reward_sent = True
 
         # ---- 3. Compute policy logprobs (GPU-bound, overlaps with BG rewards) ----
@@ -1191,16 +1236,31 @@ class GRPOTrainer(_BaseTrainer):
         _t_logprobs = _time.perf_counter()
 
         # ---- 4. Wait for rewards and compute advantages ----
-        if _reward_sent:
-            bg_results = _reward_conn.recv()
+        if _reward_sent and _reward_workers_used:
+            # Collect results from all workers and concatenate
+            all_worker_results = []
+            any_failed = False
+            for conn in _reward_workers_used:
+                result = conn.recv()
+                if result is None:
+                    any_failed = True
+                    break
+                all_worker_results.append(result)
             _t_reward_recv = _time.perf_counter()
-            if bg_results is not None:
+
+            if not any_failed:
                 rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-                for i, result in enumerate(bg_results):
-                    rewards_per_func[:, i] = torch.tensor(result, dtype=torch.float32, device=device)
+                offset = 0
+                for worker_result in all_worker_results:
+                    chunk_size = len(worker_result[0])  # number of samples this worker processed
+                    for i, result in enumerate(worker_result):
+                        rewards_per_func[offset:offset + chunk_size, i] = torch.tensor(
+                            result, dtype=torch.float32, device=device
+                        )
+                    offset += chunk_size
                 rewards_per_func = gather(rewards_per_func)
             else:
-                # Subprocess failed, fall back to main thread
+                # Some worker failed, fall back to main thread
                 rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         else:
             # Non-picklable reward funcs (nn.Module or async): compute on main thread
@@ -1259,6 +1319,100 @@ class GRPOTrainer(_BaseTrainer):
 
         # Replace placeholder advantages in the dataset
         data["advantages"] = advantages
+
+        # ---- 4b. Replay buffer: store high-signal groups, replace zero-signal ones ----
+        if self._replay_buffer is not None:
+            local_rewards = rewards_per_func[process_slice]  # (local_batch, num_reward_funcs)
+            local_grouped = local_rewards.view(-1, num_generations, len(self.reward_funcs))
+            per_group_std = local_grouped.std(dim=1)  # (local_num_groups, num_reward_funcs)
+            has_signal = (per_group_std > 0).any(dim=1)
+            no_signal = ~has_signal
+
+            # Store high-signal groups
+            if has_signal.any():
+                grouped_adv = advantages.view(-1, num_generations)
+                replay_scores = (grouped_adv.abs().sum(dim=1) * per_group_std.sum(dim=1))
+                for group_idx in has_signal.nonzero(as_tuple=True)[0]:
+                    gi = group_idx.item()
+                    start, end = gi * num_generations, (gi + 1) * num_generations
+                    group_data = {}
+                    for key in data:
+                        val = data[key]
+                        if isinstance(val, torch.Tensor) and val.dim() > 0 and val.size(0) >= end:
+                            group_data[key] = val[start:end].clone()
+                    self._replay_buffer.add(replay_scores[gi].item(), group_data)
+
+            # Replace zero-signal groups with replay buffer samples
+            n_replaced = 0
+            replaced_ranges = []  # track (start, end) for logprob recomputation
+            if no_signal.any() and len(self._replay_buffer) > 0:
+                for group_idx in no_signal.nonzero(as_tuple=True)[0]:
+                    sampled = self._replay_buffer.sample(1)
+                    if sampled is None:
+                        break
+                    sampled_group = sampled[0]
+                    gi = group_idx.item()
+                    start, end = gi * num_generations, (gi + 1) * num_generations
+                    for key, val in sampled_group.items():
+                        if key in data and isinstance(data[key], torch.Tensor):
+                            src = val.to(data[key].device)
+                            tgt_seq_len = data[key].size(1) if data[key].dim() > 1 else None
+                            if tgt_seq_len is not None:
+                                if src.size(1) <= tgt_seq_len:
+                                    data[key][start:end] = 0  # clear first
+                                    data[key][start:end, :src.size(1)] = src
+                                else:
+                                    data[key][start:end] = src[:, :tgt_seq_len]
+                            else:
+                                data[key][start:end] = src
+
+                    replaced_ranges.append((start, end))
+                    n_replaced += 1
+
+            # Recompute old_per_token_logps for replayed groups to fix IS mismatch
+            if n_replaced > 0 and self._replay_recompute_logps and "old_per_token_logps" in data:
+                with torch.no_grad(), disable_gradient_checkpointing(
+                    self.model, self.args.gradient_checkpointing_kwargs
+                ):
+                    for r_start, r_end in replaced_ranges:
+                        r_ids = torch.cat(
+                            [data["prompt_ids"][r_start:r_end], data["completion_ids"][r_start:r_end]], dim=1
+                        )
+                        r_mask = torch.cat(
+                            [data["prompt_mask"][r_start:r_end], data["completion_mask"][r_start:r_end]], dim=1
+                        )
+                        r_logits_to_keep = data["completion_ids"].size(1)
+                        r_fwd_kwargs = {}
+                        for fk in ("pixel_values", "image_grid_thw", "pixel_attention_mask",
+                                    "image_sizes", "token_type_ids", "mm_token_type_ids"):
+                            if fk in data:
+                                r_fwd_kwargs[fk] = data[fk]
+                        r_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model, r_ids, r_mask, r_logits_to_keep,
+                            r_end - r_start, **r_fwd_kwargs,
+                        )
+                        data["old_per_token_logps"][r_start:r_end] = r_logps
+
+            if n_replaced > 0:
+                self._metrics[mode]["replay_buffer_replacements"].append(float(n_replaced))
+            self._metrics[mode]["replay_buffer_size"].append(float(len(self._replay_buffer)))
+
+        # ---- 4c. Buffer zero-signal prompts for deferred re-rolling ----
+        # When all rewards in a prompt group are identical (std=0), buffer the prompt
+        # so produce() can re-inject it later when the model is more likely to solve it.
+        if self.args.reroll_start_fraction < 1.0:
+            grouped_rewards = rewards_per_func.view(-1, num_generations, len(self.reward_funcs))
+            per_group_std = grouped_rewards.std(dim=1)  # (num_groups, num_reward_funcs)
+            zero_signal = (per_group_std == 0).all(dim=1)  # (num_groups,)
+            _n_buffered = 0
+            with self._reroll_lock:
+                for group_idx in zero_signal.nonzero(as_tuple=True)[0]:
+                    prompt_input = inputs[group_idx.item() * num_generations]
+                    self._reroll_buffer.append(prompt_input)
+                    _n_buffered += 1
+            if _n_buffered > 0:
+                self._metrics[mode]["reroll_buffered"].append(float(_n_buffered))
+                self._metrics[mode]["reroll_buffer_size"].append(float(len(self._reroll_buffer)))
 
         # ---- 5. Accumulate reward metrics (main thread — safe) ----
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -2406,6 +2560,12 @@ class GRPOTrainer(_BaseTrainer):
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
+        # Skip micro-batches where all advantages are zero (no learning signal).
+        if torch.all(inputs["advantages"] == 0):
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["skipped_zero_adv_batches"].append(1.0)
+            return torch.tensor(0.0, device=inputs["advantages"].device, requires_grad=True)
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -2486,6 +2646,13 @@ class GRPOTrainer(_BaseTrainer):
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)  # (B, 1)
 
     def _compute_loss(self, model, inputs):
+        # Skip micro-batches where all advantages are zero (no learning signal).
+        # This happens when all rewards in a group are identical, making the gradient zero.
+        if torch.all(inputs["advantages"] == 0):
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["skipped_zero_adv_batches"].append(1.0)
+            return torch.tensor(0.0, device=inputs["advantages"].device, requires_grad=True)
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]

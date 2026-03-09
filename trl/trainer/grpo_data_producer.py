@@ -272,6 +272,37 @@ class GRPODataProducer(BaseDataProducer):
             self._prompt_iter = iter(self._prompt_dl)
             inputs = next(self._prompt_iter)
 
+        # Replace some prompt groups with deferred re-roll candidates.
+        # Only inject re-roll prompts after reroll_start_fraction of training,
+        # when the model is more likely to produce useful signal for previously-failed prompts.
+        reroll_buf = getattr(self._trainer, "_reroll_buffer", None)
+        reroll_lock = getattr(self._trainer, "_reroll_lock", None)
+        max_steps = getattr(self._trainer.args, "max_steps", -1)
+        start_frac = getattr(self._trainer.args, "reroll_start_fraction", 1.0)
+        max_groups = getattr(self._trainer.args, "reroll_max_groups", 1)
+        reroll_start_step = max(1, int(max_steps * start_frac)) if max_steps > 0 else float("inf")
+
+        if reroll_buf is not None and reroll_lock is not None and global_step >= reroll_start_step:
+            with reroll_lock:
+                n_to_take = min(max_groups, len(reroll_buf))
+                reroll_prompts = [reroll_buf.pop(0) for _ in range(n_to_take)]
+
+            if reroll_prompts:
+                num_gen = self._num_generations
+                n_groups = len(inputs) // num_gen
+                # Replace the last N groups with re-roll candidates
+                for i, reroll_prompt in enumerate(reroll_prompts):
+                    group_idx = n_groups - 1 - i
+                    if group_idx < 0:
+                        break
+                    start = group_idx * num_gen
+                    for j in range(num_gen):
+                        inputs[start + j] = reroll_prompt
+                logger.info(
+                    f"[REROLL] Step {global_step}: replaced {len(reroll_prompts)}/{n_groups} prompt groups "
+                    f"with deferred re-roll candidates ({len(reroll_buf)} remaining)"
+                )
+
         # Generate completions, compute rewards & advantages.
         output = self._trainer._generate_and_score_completions(
             inputs, skip_policy_logps=skip_policy_logps
