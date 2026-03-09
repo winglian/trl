@@ -1138,7 +1138,7 @@ class GRPOTrainer(_BaseTrainer):
         _t0 = _time.perf_counter()
 
         if self.use_vllm and self.args.async_prefetch:
-            sync_interval = getattr(self.args, 'vllm_sync_interval', 4)
+            sync_interval = self.args.vllm_sync_interval
             if (self.state.global_step != self._last_loaded_step and
                     self.state.global_step % sync_interval == 0):
                 # Wait for in-flight background futures so we don't mutate the

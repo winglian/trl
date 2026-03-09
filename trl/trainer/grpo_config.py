@@ -625,6 +625,14 @@ class GRPOConfig(_BaseConfig):
             "keep the GPU more saturated but increase off-policy staleness."
         },
     )
+    vllm_sync_interval: int = field(
+        default=1,
+        metadata={
+            "help": "Sync model weights to the vLLM server every N training steps when async_prefetch is enabled. "
+            "Higher values reduce sync overhead but increase off-policy staleness of generated data. "
+            "Set to 1 to sync every step (default)."
+        },
+    )
     streaming_partial_batch: bool = field(
         default=False,
         metadata={
