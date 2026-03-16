@@ -157,6 +157,7 @@ class OnlineDPOConfig(_BaseConfig):
     > - `gradient_checkpointing`: Defaults to `True` instead of `False`.
     > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`.
     > - `learning_rate`: Defaults to `5e-7` instead of `5e-5`.
+    > - `remove_unused_columns`: Defaults to `False` instead of `True`.
     """
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs"]
@@ -165,6 +166,10 @@ class OnlineDPOConfig(_BaseConfig):
     learning_rate: float = field(
         default=5e-7,
         metadata={"help": "The initial learning rate for AdamW."},
+    )
+    remove_unused_columns: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to automatically remove the columns unused by the model forward method."},
     )
 
     reward_model_path: str | None = field(
