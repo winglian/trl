@@ -1003,6 +1003,40 @@ class SFTTrainer(_BaseTrainer):
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
 
+    def _tokenize(
+        self,
+        processing_class: PreTrainedTokenizerBase | ProcessorMixin,
+        input: str | list,
+        **kwargs,
+    ) -> dict[str, list]:
+        """Tokenize a single example for dataset preprocessing.
+
+        Dispatches to `apply_chat_template` for conversational input (list of message dicts) and to `__call__` for
+        non-conversational input (str). For VLMs, normalizes the batch dimension that processors emit even for single
+        examples.
+
+        Args:
+            processing_class ([`~transformers.PreTrainedTokenizerBase`] or [`~transformers.ProcessorMixin`]):
+                The tokenizer or processor to use.
+            input (`str` or `list`):
+                A string for non-conversational input, or a list of message dicts for conversational input.
+            **kwargs:
+                Forwarded to `apply_chat_template` (e.g. `add_generation_prompt`, `return_assistant_tokens_mask`).
+
+        Returns:
+            `dict` with at least an `"input_ids"` key mapping to a flat `list[int]`.
+        """
+        if isinstance(input, list):  # conversational: list of message dicts
+            if self._is_vlm:
+                input = prepare_multimodal_messages(input, images=[])
+            result = processing_class.apply_chat_template(input, tokenize=True, return_dict=True, **kwargs)
+        else:  # non-conversational: plain text string
+            result = processing_class(text=input)
+        # VLMs emit a batch dimension even for single examples; unwrap it
+        if self._is_vlm:
+            return {k: v[0] for k, v in result.items()}
+        return result
+
     def _prepare_dataset(
         self,
         dataset: Dataset | IterableDataset,
@@ -1088,53 +1122,28 @@ class SFTTrainer(_BaseTrainer):
                     if "prompt" in example:  # prompt-completion case
                         output = {}
                         if is_conversational(example):
-                            if self._is_vlm:
-                                prompt = prepare_multimodal_messages(example["prompt"], images=[])
-                                completion = prepare_multimodal_messages(example["completion"], images=[])
-                            else:
-                                prompt = example["prompt"]
-                                completion = example["completion"]
-                            prompt_ids = processing_class.apply_chat_template(
-                                prompt,
+                            prompt_ids = self._tokenize(
+                                processing_class,
+                                example["prompt"],
                                 tools=tools,
                                 add_generation_prompt=True,
-                                tokenize=True,
-                                return_dict=False,
                                 **example.get("chat_template_kwargs", {}),
-                            )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_ids = prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids
-                            prompt_completion_processed = processing_class.apply_chat_template(
-                                prompt + completion,
+                            )["input_ids"]
+                            prompt_completion_processed = self._tokenize(
+                                processing_class,
+                                example["prompt"] + example["completion"],
                                 tools=tools,
-                                tokenize=True,
-                                return_dict=True,
                                 return_assistant_tokens_mask=assistant_only_loss,
                                 **example.get("chat_template_kwargs", {}),
                             )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_completion_processed = {
-                                k: v[0] if isinstance(v[0], list) else v
-                                for k, v in prompt_completion_processed.items()
-                            }
                             prompt_completion_ids = prompt_completion_processed["input_ids"]
                             if "assistant_masks" in prompt_completion_processed:
                                 output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
                         else:
-                            prompt_ids = processing_class(text=example["prompt"])["input_ids"]
-                            prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])[
-                                "input_ids"
-                            ]
-                            # Fix transformers inconsistency: for VLMs, processing_class returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            prompt_ids = prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids
-                            prompt_completion_ids = (
-                                prompt_completion_ids[0]
-                                if isinstance(prompt_completion_ids[0], list)
-                                else prompt_completion_ids
-                            )
+                            prompt_ids = self._tokenize(processing_class, example["prompt"])["input_ids"]
+                            prompt_completion_ids = self._tokenize(
+                                processing_class, example["prompt"] + example["completion"]
+                            )["input_ids"]
 
                         # Check if the tokenized prompt starts with the tokenized prompt+completion
                         if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
@@ -1151,27 +1160,18 @@ class SFTTrainer(_BaseTrainer):
 
                     else:  # language modeling case
                         if is_conversational(example):
-                            if self._is_vlm:
-                                messages = prepare_multimodal_messages(example["messages"], images=[])
-                            else:
-                                messages = example["messages"]
-                            processed = processing_class.apply_chat_template(
-                                messages,
+                            processed = self._tokenize(
+                                processing_class,
+                                example["messages"],
                                 tools=tools,
-                                tokenize=True,
-                                return_dict=True,
                                 return_assistant_tokens_mask=assistant_only_loss,
                                 **example.get("chat_template_kwargs", {}),
                             )
-                            # Fix transformers inconsistency: for VLMs, apply_chat_template returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            processed = {k: v[0] if isinstance(v[0], list) else v for k, v in processed.items()}
                             output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
                         else:
-                            # Fix transformers inconsistency: for VLMs, processing_class returns lists of lists
-                            # even for single examples, while for LLMs it returns lists of ints.
-                            ids = processing_class(text=example[dataset_text_field])["input_ids"]
-                            output = {"input_ids": ids[0] if isinstance(ids[0], list) else ids}
+                            output = {
+                                "input_ids": self._tokenize(processing_class, example[dataset_text_field])["input_ids"]
+                            }
 
                     if "assistant_masks" in output and 1 not in output["assistant_masks"]:
                         raise RuntimeError(
