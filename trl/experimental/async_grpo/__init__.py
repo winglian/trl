@@ -14,3 +14,4 @@
 
 from .async_grpo_config import AsyncGRPOConfig
 from .async_grpo_trainer import AsyncGRPOTrainer
+from .data_producer import AsyncGRPODataProducer, RolloutBatchDataset

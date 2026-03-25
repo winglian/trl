@@ -185,6 +185,29 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Number of training steps between weight synchronizations to the vLLM server."},
     )
 
+    # Parameters that control data producer mode
+    use_data_producer: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the transformers DataProducer protocol instead of the IterableDataset queue. "
+            "Enables batch collection from the rollout queue and async prefetch of the next batch "
+            "while training on the current one."
+        },
+    )
+    async_prefetch: bool = field(
+        default=True,
+        metadata={
+            "help": "When use_data_producer=True, prefetch the next rollout batch in a background thread "
+            "while training on the current one. This overlaps queue collection with training."
+        },
+    )
+    samples_per_rollout: int = field(
+        default=-1,
+        metadata={
+            "help": "Number of samples to collect per DataProducer rollout. Defaults to -1 (auto), "
+            "which sets it to per_device_train_batch_size * gradient_accumulation_steps * num_processes."
+        },
+    )
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
@@ -201,14 +224,15 @@ class AsyncGRPOConfig(_BaseConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
-        # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader
-        # and batches are broadcast to other processes rather than each process pulling independently.
-        if not hasattr(self, "accelerator_config") or self.accelerator_config is None:
-            self.accelerator_config = {"split_batches": True, "dispatch_batches": True}
-        elif isinstance(self.accelerator_config, dict):
-            self.accelerator_config["split_batches"] = True
-            self.accelerator_config["dispatch_batches"] = True
-        else:
-            self.accelerator_config.split_batches = True
-            self.accelerator_config.dispatch_batches = True
+        if not self.use_data_producer:
+            # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
+            # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader
+            # and batches are broadcast to other processes rather than each process pulling independently.
+            if not hasattr(self, "accelerator_config") or self.accelerator_config is None:
+                self.accelerator_config = {"split_batches": True, "dispatch_batches": True}
+            elif isinstance(self.accelerator_config, dict):
+                self.accelerator_config["split_batches"] = True
+                self.accelerator_config["dispatch_batches"] = True
+            else:
+                self.accelerator_config.split_batches = True
+                self.accelerator_config.dispatch_batches = True

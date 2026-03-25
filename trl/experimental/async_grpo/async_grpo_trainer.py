@@ -35,6 +35,7 @@ from trl.trainer.utils import pad, selective_log_softmax
 
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker
+from .data_producer import AsyncGRPODataProducer, RolloutBatchDataset
 
 
 logger = get_logger(__name__)
@@ -290,7 +291,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         # Model
         model_name = model
-        model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.float32)
+        # Load in bf16 when bf16 training is enabled to reduce GPU memory footprint.
+        # The NCCL weight transfer to vLLM handles dtype matching automatically.
+        model_dtype = torch.bfloat16 if self.args.bf16 else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=model_dtype)
 
         # Processing class
         if processing_class is None:
@@ -302,11 +306,67 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
 
+        # Compute samples_per_step early (needed for data producer setup before super().__init__)
+        # Note: num_processes is not yet available (accelerator not created), so we use 1 for single-GPU
+        # and adjust after super().__init__() if needed.
+        samples_per_step = (
+            self.args.per_device_train_batch_size
+            * self.args.gradient_accumulation_steps
+        )
+
+        # --- Data producer setup (before super().__init__) ---
+        data_producer = None
+        self._use_data_producer = self.args.use_data_producer
+
+        if self._use_data_producer:
+            from transformers.data_producer import ProducerConfig, AsyncDataProducer
+
+            samples_per_rollout = self.args.samples_per_rollout
+            if samples_per_rollout < 0:
+                samples_per_rollout = samples_per_step
+
+            producer_config = ProducerConfig(
+                mini_epochs=1,
+                async_prefetch=self.args.async_prefetch,
+                prefetch_depth=1,
+                eval_during_produce=False,  # No model.eval() needed — we don't use the model in produce()
+                empty_cache_before_produce=False,
+                empty_cache_after_produce=False,
+            )
+
+            self._grpo_producer = AsyncGRPODataProducer(
+                config=producer_config,
+                samples_per_rollout=samples_per_rollout,
+                max_staleness=self.args.max_staleness,
+                timeout=self.args.vllm_server_timeout,
+            )
+
+            if self.args.async_prefetch:
+                data_producer = AsyncDataProducer(self._grpo_producer)
+                logger.info(
+                    f"DataProducer: async prefetch enabled, "
+                    f"samples_per_rollout={samples_per_rollout}"
+                )
+            else:
+                data_producer = self._grpo_producer
+                logger.info(
+                    f"DataProducer: sync mode, "
+                    f"samples_per_rollout={samples_per_rollout}"
+                )
+
+        # For DataProducer path, disable column removal — our rollout dataset has
+        # custom keys (advantage, completion_mask, old_log_probs, metrics) that
+        # don't match the model's forward() signature.
+        if self._use_data_producer:
+            self.args.remove_unused_columns = False
+
         # Initialize the Trainer
         super().__init__(
             model=model,
             args=self.args,
-            train_dataset=train_dataset,
+            train_dataset=train_dataset if not self._use_data_producer else None,
+            data_producer=data_producer,
+            data_collator=DataCollatorForRollout(processing_class.pad_token_id),
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
@@ -317,13 +377,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
 
-        # Infer max_steps from dataset size when not explicitly set. This must happen after super().__init__()
-        # so that self.accelerator.num_processes is available for the correct calculation.
+        # Recompute with actual num_processes now that accelerator is available
         samples_per_step = (
             self.args.per_device_train_batch_size
             * self.args.gradient_accumulation_steps
             * self.accelerator.num_processes
         )
+
+        # Infer max_steps from dataset size when not explicitly set.
         if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
             samples_per_epoch = len(train_dataset) * self.args.num_generations
             self.args.max_steps = int(self.args.num_train_epochs * samples_per_epoch / samples_per_step)
@@ -341,9 +402,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._train_tokens_start_time = None
         self.model_version = 0
+        self._last_grad_norm = None  # Track for optimization decisions
+
         # Create worker and queue on rank 0
         if self.accelerator.is_main_process:
-            if self.train_dataset is None:
+            if train_dataset is None:
                 raise ValueError("train_dataset is required for AsyncGRPOTrainer")
 
             if rollout_worker is not None:
@@ -382,14 +445,25 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     weight_shapes=weight_shapes,
                 )
             self.rollout_queue = self.rollout_worker.rollout_buffer
+
+            # Inject queue into data producer
+            if self._use_data_producer:
+                producer = self._grpo_producer
+                producer.set_queue(self.rollout_queue, lambda: self.model_version)
         else:
             self.rollout_queue = None
             self.rollout_worker = None
 
-        # Add callbacks
+        # Add weight sync callback for both paths.
+        # Weight sync happens at step boundary via callback, independent of produce() timing.
+        # This keeps produce() lightweight and lets weight sync overlap with BG prefetch.
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
 
     def get_train_dataloader(self) -> DataLoader:
+        # DataProducer path uses _get_online_dataloader from the Trainer base class
+        if self._use_data_producer:
+            return super().get_train_dataloader()
+
         if self.accelerator.is_main_process:
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
@@ -411,6 +485,22 @@ class AsyncGRPOTrainer(_BaseTrainer):
             # dispatch_batches = True for DataLoader whose underlying dataset is an IterableDataset
             # dataloader prepared by the Accelerator is only iterated through on the main process a
         )
+
+    def get_collator(self):
+        """Return the data collator for the DataProducer path."""
+        if self._use_data_producer:
+            return DataCollatorForRollout(self.processing_class.pad_token_id)
+        return super().get_collator()
+
+    def _produce_data(self, model):
+        """Call the data producer to get a fresh batch of rollout samples.
+
+        Weight sync is handled separately via StepIntervalCallback, not here.
+        This keeps produce() lightweight — for AsyncDataProducer, it just pops
+        the pre-fetched result from the queue (non-blocking if BG thread finished)
+        and kicks off the next prefetch.
+        """
+        return super()._produce_data(model)
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -572,16 +662,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
     def _sync_weight(self):
         t0 = time.time()
-        logger.info("Weight sync: pausing vLLM...")
+        logger.info("[RANK 0] Weight sync: pausing vLLM...")
         if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.pause()
         t_pause = time.time()
-        logger.info(f"Weight sync: pause took {t_pause - t0:.1f}s, waiting for all ranks...")
+        logger.info(f"[RANK 0] Weight sync: pause took {t_pause - t0:.1f}s, waiting for all ranks...")
 
         self.accelerator.wait_for_everyone()
         t_barrier = time.time()
 
-        logger.info(f"Weight sync: transferring weights... (barrier took {t_barrier - t_pause:.1f}s)")
+        logger.info(f"[RANK 0] Weight sync: transferring weights... (barrier took {t_barrier - t_pause:.1f}s)")
         if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.send_weights(self._streaming_iter())
         else:
@@ -592,14 +682,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         self.accelerator.wait_for_everyone()
 
-        logger.info(f"Weight sync: resuming vLLM... (transfer took {t_transfer - t_barrier:.1f}s)")
+        logger.info(f"[RANK 0] Weight sync: resuming vLLM... (transfer took {t_transfer - t_barrier:.1f}s)")
         if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.resume()
             self.model_version += 1
             self.rollout_worker.update_model_version(self.model_version)
         weight_sync_time_s = time.time() - t0
         self._metrics["train"]["weight_sync_time_s"].append(weight_sync_time_s)
-        logger.info(f"Weight sync: done. Total {weight_sync_time_s:.1f}s")
+        logger.info(f"[RANK 0] Weight sync: done. Total {weight_sync_time_s:.1f}s")
 
     def _inner_training_loop(self, *args, **kwargs):
         # Start the rollout worker here (not in __init__) so that checkpoint loading in Trainer.train()

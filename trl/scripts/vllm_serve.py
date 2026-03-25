@@ -24,6 +24,9 @@ from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
 
+# Re-export extract_logprobs for compatibility with axolotl's vllm_serve_lora
+from trl.generation.vllm_generation import extract_logprobs  # noqa: F401
+
 
 # We use CUDA with multiprocessing, so we must use the 'spawn' start method. Otherwise, we will get the following
 # error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
@@ -858,6 +861,25 @@ def main(script_args: ScriptArguments):
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
 
         return {"message": "Request received, updating named parameter"}
+
+    class BatchUpdateWeightsRequest(BaseModel):
+        params: list[dict]  # list of {"name": str, "dtype": str, "shape": list[int]}
+
+    @app.post("/batch_update_named_params/")
+    async def batch_update_named_params(request: BatchUpdateWeightsRequest):
+        """
+        Batch version of update_named_param. Accepts a list of parameter metadata
+        and triggers NCCL broadcasts for each parameter sequentially.
+        Compatible with axolotl's batched weight sync monkeypatch.
+        """
+        for param in request.params:
+            kwargs = {
+                "method": "update_named_param",
+                "args": (param["name"], param["dtype"], tuple(param["shape"])),
+            }
+            for connection in connections:
+                connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": f"Request received, updating {len(request.params)} parameters"}
 
     @app.post("/reset_prefix_cache/")
     async def reset_prefix_cache():
