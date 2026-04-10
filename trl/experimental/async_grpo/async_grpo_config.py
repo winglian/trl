@@ -184,6 +184,20 @@ class AsyncGRPOConfig(_BaseConfig):
         default=1,
         metadata={"help": "Number of training steps between weight synchronizations to the vLLM server."},
     )
+    use_prefetch: bool = field(
+        default=False,
+        metadata={
+            "help": "Use background-thread prefetch for the rollout queue (no DataProducer dependency). "
+            "Batch-collects samples_per_step samples in a background thread while training."
+        },
+    )
+    prefetch_depth: int = field(
+        default=1,
+        metadata={
+            "help": "Number of batches to prefetch ahead when use_prefetch=True. "
+            "Higher values keep training saturated but increase off-policy staleness."
+        },
+    )
 
     # Parameters that control the logging
     log_completions: bool = field(
