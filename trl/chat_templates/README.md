@@ -25,6 +25,10 @@ Original GPT-OSS chat template.
 
 Original Qwen3 chat template.
 
+### `qwen3_vl.jinja`
+
+Original Qwen3-VL chat template. Unlike text-only Qwen3, this template is already prefix-preserving (no conditional thinking blocks), so no training patch is needed.
+
 ### `qwen3_5_2b_and_below.jinja` / `qwen3_5_4b_and_above.jinja`
 
 Original Qwen3.5 chat templates.

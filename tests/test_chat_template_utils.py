@@ -116,7 +116,8 @@ class TestCloneChatTemplate(TrlTestCase):
     [
         pytest.param("trl-internal-testing/tiny-Glm4MoeForCausalLM", id="glm4moe"),
         pytest.param("trl-internal-testing/tiny-GptOssForCausalLM", id="gptoss"),
-        pytest.param("trl-internal-testing/tiny-Qwen3MoeForSequenceClassification", id="qwen3"),
+        pytest.param("trl-internal-testing/tiny-Qwen3MoeForCausalLM", id="qwen3"),
+        pytest.param("trl-internal-testing/tiny-Qwen3VLForConditionalGeneration", id="qwen3_vl"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration", id="qwen35"),
     ],
 )
@@ -215,7 +216,7 @@ class TestSupportsToolCalling:
 
 class TestIsChatTemplatePrefixPreserving:
     def test_prefix_preserving_template(self):
-        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForSequenceClassification")
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # docstyle-ignore
         tokenizer.chat_template = textwrap.dedent(r"""
         {%- for message in messages %}
@@ -245,7 +246,7 @@ class TestIsChatTemplatePrefixPreserving:
         assert is_chat_template_prefix_preserving(tokenizer) is True
 
     def test_non_prefix_preserving_template(self):
-        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForSequenceClassification")
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # The following template is quite typical of models like Qwen3 and GPT-OSS, where the thinking part (even
         # empty) is only present for last assistant message, which makes it non-prefix-preserving: appending a tool
         # message changes the earlier output.
@@ -312,7 +313,7 @@ class TestIsChatTemplatePrefixPreserving:
     [
         pytest.param("trl-internal-testing/tiny-GptOssForCausalLM", id="gptoss"),
         pytest.param("trl-internal-testing/tiny-LlamaForCausalLM-3", id="llama3"),
-        pytest.param("trl-internal-testing/tiny-Qwen3MoeForSequenceClassification", id="qwen3"),
+        pytest.param("trl-internal-testing/tiny-Qwen3MoeForCausalLM", id="qwen3"),
     ],
 )
 class TestGetTrainingChatTemplate:
@@ -503,7 +504,8 @@ class TestGetTrainingChatTemplate:
     [
         pytest.param("trl-internal-testing/tiny-Glm4MoeForCausalLM", id="glm4moe"),
         pytest.param("trl-internal-testing/tiny-GptOssForCausalLM", id="gptoss"),
-        pytest.param("trl-internal-testing/tiny-Qwen3MoeForSequenceClassification", id="qwen3"),
+        pytest.param("trl-internal-testing/tiny-Qwen3MoeForCausalLM", id="qwen3"),
+        pytest.param("trl-internal-testing/tiny-Qwen3VLForConditionalGeneration", id="qwen3_vl"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration", id="qwen35"),
         pytest.param(
             "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
@@ -540,8 +542,10 @@ class TestParseResponse:
         if tokenizer_name in (
             "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
             "trl-internal-testing/tiny-GptOssForCausalLM",
+            "trl-internal-testing/tiny-Qwen3VLForConditionalGeneration",
         ):
-            pytest.skip("This model doesn't support inline reasoning_content.")
+            pytest.skip("This tokenizer doesn't support inline reasoning_content.")
+
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         if getattr(tokenizer, "response_schema", None) is None:
             tokenizer = add_response_schema(tokenizer)
@@ -629,7 +633,7 @@ class TestParseResponse:
         assert parsed == messages[-1]
 
     def test_parse_response_malformed_tool_call(self, tokenizer_name):
-        if tokenizer_name != "trl-internal-testing/tiny-Qwen3MoeForSequenceClassification":
+        if tokenizer_name != "trl-internal-testing/tiny-Qwen3MoeForCausalLM":
             pytest.skip("For simplicity, we only test the malformed tool call case on one tokenizer.")
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         if getattr(tokenizer, "response_schema", None) is None:
