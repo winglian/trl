@@ -52,6 +52,7 @@ from ...trainer.utils import (
     disable_dropout_in_model,
     get_config_model_id,
     selective_log_softmax,
+    use_adapter,
 )
 from ..utils import DPODataCollatorWithPadding, peft_module_casting_to_bf16
 from .kto_config import KTOConfig
@@ -286,10 +287,6 @@ class KTOTrainer(_BaseTrainer):
         compute_metrics (`Callable[[EvalPrediction], dict]`, *optional*):
             The function to use to compute the metrics. Must take a `EvalPrediction` and return a dictionary string to
             metric values.
-        model_adapter_name (`str`, defaults to `None`):
-            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
-        ref_adapter_name (`str`, defaults to `None`):
-            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
     """
 
     _tag_names = ["trl", "kto"]
@@ -326,8 +323,6 @@ class KTOTrainer(_BaseTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: dict | None = None,
         compute_metrics: Callable[[EvalLoopOutput], dict] | None = None,
-        model_adapter_name: str | None = None,
-        ref_adapter_name: str | None = None,
     ):
         # Args
         if args is None:
@@ -365,14 +360,22 @@ class KTOTrainer(_BaseTrainer):
             raise ValueError(
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it with `pip install peft` to use the PEFT models"
             )
-        elif is_peft_available() and peft_config is not None:
-            if isinstance(model, PeftModel):
-                raise ValueError(
-                    "You passed a `PeftModel` instance together with a `peft_config` to the trainer. Please first "
-                    "merge and unload the existing adapter, save the resulting base model, and then pass that base "
-                    "model along with the new `peft_config` to the trainer."
-                )
-
+        if is_peft_available() and isinstance(model, PeftModel) and peft_config is not None:
+            raise ValueError(
+                "You passed a `PeftModel` instance together with a `peft_config` to the trainer. Please first merge "
+                "and unload the existing adapter, save the resulting base model, and then pass that base model along "
+                "with the new `peft_config` to the trainer."
+            )
+        if is_peft_available() and isinstance(model, PeftModel) and ref_model is None:
+            # If the model is a PEFT model with a pretrained adapter, we need to create a "ref" adapter that is a copy
+            # of the "default" adapter, so that we can use it as the reference model during KTO training.
+            model.add_adapter("ref", model.peft_config["default"])
+            for name, param in model.named_parameters():
+                if ".default." in name:
+                    ref_name = name.replace(".default.", ".ref.")
+                    ref_param = model.get_parameter(ref_name)
+                    ref_param.data.copy_(param.data)
+        if is_peft_available() and peft_config is not None:
             if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
                 _support_gc_kwargs = hasattr(
                     args, "gradient_checkpointing_kwargs"
@@ -426,8 +429,6 @@ class KTOTrainer(_BaseTrainer):
             )
 
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
-        self.model_adapter_name = model_adapter_name
-        self.ref_adapter_name = ref_adapter_name
 
         if processing_class is None:
             raise ValueError(
@@ -725,7 +726,7 @@ class KTOTrainer(_BaseTrainer):
                     "You cannot use `precompute_ref_log_probs=True` with liger kernel. Please set "
                     "`precompute_ref_log_probs=False`."
                 )
-            if self.is_peft_model or self.ref_adapter_name is not None:
+            if self.is_peft_model:
                 raise ValueError(
                     "You cannot use `use_liger_kernel=True` with Peft models. Please set `use_liger_kernel=False`."
                 )
@@ -755,16 +756,12 @@ class KTOTrainer(_BaseTrainer):
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
-        with (
-            self.accelerator.unwrap_model(self.model).disable_adapter()
-            if self.is_peft_model and not self.ref_adapter_name
-            else nullcontext()
-        ):
-            if self.ref_adapter_name:
-                self.model.set_adapter(self.ref_adapter_name)
+        if self.is_peft_model:
+            model = self.accelerator.unwrap_model(self.model)
+            with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                yield
+        else:
             yield
-            if self.ref_adapter_name:
-                self.model.set_adapter(self.model_adapter_name or "default")
 
     def _precompute_ref_logps(self, dataset: Dataset, name: str, batch_size: int) -> Dataset:
         dataloader_params = {
