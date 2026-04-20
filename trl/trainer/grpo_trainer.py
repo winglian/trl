@@ -76,7 +76,6 @@ from .utils import (
     RepeatSampler,
     create_model_from_path,
     disable_dropout_in_model,
-    entropy_from_logits,
     get_config_model_id,
     identity,
     nanmax,
@@ -84,7 +83,6 @@ from .utils import (
     nanstd,
     pad,
     print_prompt_completions_sample,
-    selective_log_softmax,
     shuffle_sequence_dict,
     shutdown_event_loop_in_daemon,
     split_pixel_values_by_grid,
@@ -93,6 +91,8 @@ from .utils import (
     unsplit_pixel_values_by_grid,
     use_adapter,
 )
+
+from ..optims import entropy_from_logits, selective_log_softmax
 
 
 if is_peft_available():
